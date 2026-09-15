@@ -81,13 +81,42 @@ location / {
 
 链路：`客户端 → new-api → cline-pass-switcher → Cline 网关`
 
-`docker-compose.yml` 已按此场景配好。关键是三者：加入 new-api 所在网络、容器内绑 `0.0.0.0`、设置 `PROXY_KEY`。
+`docker-compose.yml` 已按此场景配好。关键是三者：与 new-api 同网络、容器内绑 `0.0.0.0`、设置 `PROXY_KEY`。
 
 ```bash
+git clone https://github.com/amo0114/cline-pass-switcher.git && cd cline-pass-switcher
 mkdir -p data && cp config.example.json data/config.json
-cp .env.example .env && sed -i 's/^PROXY_KEY=.*/PROXY_KEY=你的代理密钥/' .env
+cp .env.example .env
+vi .env                     # 设置 PROXY_KEY（必填）
 docker compose up -d --build
 ```
+
+网络接线二选一，**注意选错会启动失败**：
+
+**A. 加入 new-api 的网络（推荐）** —— 先在 `.env` 里设 `NET_NAME=<new-api的网络名>`：
+
+```bash
+docker network ls | grep -i new-api        # 确认网络名，常见为 new-api_default 或 <项目名>_default
+echo 'NET_NAME=你的网络名' >> .env
+docker compose up -d --build
+```
+
+若网络名填错或不存在，compose 会报 `network ... declared as external, but could not be found` 并中止。
+
+**B. 先独立启动，再接入 new-api 网络** —— 适合不确定网络名的情况：
+
+```bash
+docker compose up -d --build
+docker network connect <new-api的网络名> cline-pass-console
+```
+
+接线完成后验证互通（把 `<网络名>` 换成实际值）：
+
+```bash
+docker run --rm --network <网络名> curlimages/curl:latest \
+  -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $PROXY_KEY" \
+  http://cline-pass-console:3123/v1/models
+# 返回 200 即通
 
 在 new-api 后台新建渠道：
 
@@ -98,20 +127,9 @@ docker compose up -d --build
 | 密钥 | 与 `PROXY_KEY` 相同 |
 | 模型 | 点「获取模型列表」自动拉取；或用 `model_mapping` 把 `cline-pass/*` 映射成你想要的对外名 |
 
-若 new-api 不在 `new-api_default` 网络，两种办法：改 `.env` 里的 `NET_NAME`，或事后接入：
-
-```bash
-docker network connect <new-api的实际网络名> cline-pass-console
-```
-
 **行为差异（重要）**：本服务的「失败自动顺切下一个上游」是在**同一请求内**改写 `provider.only` 重发；new-api 的故障转移是换**渠道**。若要做到「同一模型、上游 A 挂了切上游 B」，在 new-api 建两个渠道（同模型、不同 `Priority`），或直接在本服务控制台配好「优先 + 回退」，由本服务内部完成切换。
 
-**本服务不发布端口到宿主机**。要访问控制台，可临时开 `ports` 映射，或：
-
-```bash
-docker exec -it cline-pass-console node -e "console.log('访问 http://127.0.0.1:3123/')"
-docker run --rm --network container:cline-pass-console curlimages/curl -s localhost:3123/api/meta
-```
+**本服务默认不发布端口到宿主机**。要从本机浏览器访问控制台，取消 `docker-compose.yml` 里 `ports` 的注释后 `docker compose up -d`，用完记得注释回去。
 
 ### 环境变量
 

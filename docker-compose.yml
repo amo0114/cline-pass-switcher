@@ -1,35 +1,45 @@
 # 同机部署：new-api（容器）→ cline-pass-switcher（容器）
 #
-# 用法：
-#   1. mkdir -p data && cp config.example.json data/config.json
-#   2. 设置下游密钥：在 .env 里写 PROXY_KEY=<你的代理密钥>
-#   3. docker compose up -d --build
-#   4. new-api 新建渠道：类型 Custom，Base URL 填 http://cline-pass-console:3123/v1，Key 填 PROXY_KEY
+# 快速开始（生产机）：
+#   git clone https://github.com/amo0114/cline-pass-switcher.git && cd cline-pass-switcher
+#   mkdir -p data && cp config.example.json data/config.json
+#   cp .env.example .env && vi .env          # 至少设置 PROXY_KEY
+#   docker compose up -d --build
 #
-# 网络接线（关键）：
-#   - 默认加入名为 `new-api_default` 的外部网络，new-api 容器可直接用容器名访问本服务
-#   - 如果你的 new-api 不在该网络，改 NET_NAME 或在 new-api 侧执行：
-#       docker network connect <new-api网络名> cline-pass-console
-#   - 本服务不发布端口到宿主机；控制台仅通过 `docker exec` 内的回环访问，
-#     或临时开启下面的 ports 映射（不建议长期开启）
+# 然后接入 new-api：
+#   新建渠道 → 类型 Custom → Base URL: http://cline-pass-console:3123/v1 → Key: 同 PROXY_KEY
+#   （点「获取模型列表」可自动拉取模型）
+#
+# 网络接线（二选一）：
+#   A. 让本服务加入 new-api 所在网络（默认方式，推荐）：
+#      在 .env 里设置 NET_NAME=<new-api的网络名>，先确保该网络存在：
+#        docker network ls | grep new-api
+#      若网络名不符，compose 启动会报 "network ... declared as external, but could not be found"。
+#   B. 保持默认独立网络，事后把本容器接入 new-api 网络：
+#        docker compose up -d
+#        docker network connect <new-api的网络名> cline-pass-console
+#
+# 控制台访问：本服务不发布端口到宿主机（仅同网络容器可达）。
+#   如需从本机浏览器访问控制台，临时取消下面 ports 注释后重启；用完记得注释回去。
 services:
   cline-pass-console:
     build: .
-    image: cline-pass-switcher:1.2.0
+    image: cline-pass-switcher:1.2.1
     container_name: cline-pass-console
     restart: unless-stopped
     environment:
       - DATA_DIR=/data
       # 容器内必须绑 0.0.0.0，否则同网络的其他容器访问不到
       - BIND_HOST=0.0.0.0
-      # 下游代理密钥：new-api 侧渠道的 Key 填同一个值；留空则仅回环地址可管理
+      # 下游代理密钥：new-api 侧渠道的 Key 填同一个值；留空则管理面仅回环地址可访问
       - PROXY_KEY=${PROXY_KEY:-}
     volumes:
       - ./data:/data
+    # ports:
+    #   - "127.0.0.1:3123:3123"   # 仅本机可访问；需要时取消注释
     networks:
       - ai-stack
 
 networks:
   ai-stack:
-    external: true
-    name: ${NET_NAME:-new-api_default}
+    name: ${NET_NAME:-cline-pass-net}
