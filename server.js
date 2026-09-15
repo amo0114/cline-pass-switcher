@@ -8,6 +8,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
@@ -129,11 +130,35 @@ const chatHeaders = (key) => ({
 // 控制台页面本身保持开放（不含任何敏感数据，数据由带鉴权的 /api/* 提供）。
 // 可通过 POST /api/security 在运行期修改（下游密钥 = 客户端访问代理的凭据）。
 let PROXY_KEY = config.proxyKey || '';
+
+// 恒定时间比较：先各自 sha256 成定长摘要再比，长度差异与时序均不泄漏密钥信息
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// 管理面（/api/*）与代理面（/v1/*）分离：
+// - 代理面：PROXY_KEY 为空时放行（本地自用），非空时校验
+// - 管理面：涉及账号密钥、代理密钥、配置读写。PROXY_KEY 为空且请求来自非回环地址时一律拒绝，
+//   避免「未设密钥 = 任意可读账号池」；本机回环访问保留免密钥便利性。
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+function isLoopback(req) {
+  const ip = req.socket?.remoteAddress || '';
+  return LOOPBACK.has(ip);
+}
 function authOK(req) {
   if (!PROXY_KEY) return true;
   const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   const admin = String(req.headers['x-admin-key'] || '').trim();
-  return bearer === PROXY_KEY || admin === PROXY_KEY;
+  // 两侧都做恒定时间比较，且不短路，避免通过响应时间区分命中方式
+  const okBearer = bearer ? safeEqual(bearer, PROXY_KEY) : false;
+  const okAdmin = admin ? safeEqual(admin, PROXY_KEY) : false;
+  return okBearer || okAdmin;
+}
+function adminOK(req) {
+  if (PROXY_KEY) return authOK(req);
+  return isLoopback(req);
 }
 function unauthorized(res) {
   return sendJSON(res, 401, { error: { message: 'unauthorized: 代理密钥缺失或错误', type: 'auth_error' } });
@@ -755,6 +780,20 @@ async function catalog() {
   return META.catalog || [];
 }
 
+// 密钥脱敏：保留前缀与末 4 位，中间定长掩码（不泄漏原长度）
+function maskKey(k) {
+  const s = String(k || '');
+  if (!s) return '';
+  if (s.length <= 8) return '*'.repeat(s.length);
+  const head = s.slice(0, 3);
+  const tail = s.slice(-4);
+  return `${head}${'*'.repeat(8)}${tail}`;
+}
+// 判断是否为脱敏占位（前端原样回传时不应覆盖真实密钥）
+function isMasked(k) {
+  return typeof k === 'string' && k.includes('********');
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
@@ -770,8 +809,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/meta') {
       return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), configured: isConfigured() });
     }
-    if (p.startsWith('/api/') || p.startsWith('/v1/') || CHAT_PATHS.has(p)) {
-      if (!authOK(req)) return unauthorized(res);
+    // 管理面严格鉴权：密钥为空时仅允许回环地址（避免账号池被外部读取）
+    if (p.startsWith('/api/') && p !== '/api/meta') {
+      if (!adminOK(req)) return unauthorized(res);
+    }
+    // 代理面：密钥为空时放行（本地自用），非空时校验
+    if ((p.startsWith('/v1/') || CHAT_PATHS.has(p)) && !authOK(req)) {
+      return unauthorized(res);
     }
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -817,8 +861,13 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === 'GET' && p === '/api/accounts') {
+      // 默认脱敏：只回 key 尾部 4 位。需要回填编辑时前端用 GET /api/accounts?reveal=1。
+      const reveal = url.searchParams.get('reveal') === '1';
       return sendJSON(res, 200, {
-        accounts: config.accounts,
+        accounts: config.accounts.map((a) => ({
+          ...a,
+          key: reveal ? a.key : maskKey(a.key),
+        })),
         mode: config.accountMode,
         active: config.activeAccount,
         stats: META.stats || {},
@@ -826,12 +875,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/accounts') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
+      const prev = config.accounts || [];
       const accs = (Array.isArray(body.accounts) ? body.accounts : [])
-        .map((a, i) => ({
-          name: String(a.name || `账号${i + 1}`).slice(0, 50),
-          key: String(a.key || '').trim(),
-          enabled: a.enabled !== false,
-        }))
+        .map((a, i) => {
+          const raw = String(a.key || '').trim();
+          // 前端未改动密钥时会回传脱敏值：按下标回填原密钥，避免把掩码写成真 key
+          const key = isMasked(raw) ? (prev[i]?.key || '') : raw;
+          return {
+            name: String(a.name || `账号${i + 1}`).slice(0, 50),
+            key,
+            enabled: a.enabled !== false,
+          };
+        })
         .filter((a) => a.key);
       if (!accs.length) return sendJSON(res, 400, { error: { message: '至少需要一个有效账号（key 非空）' } });
       config.accounts = accs;
@@ -864,16 +919,39 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, ms: Date.now() - t0, model });
     }
     if (req.method === 'GET' && p === '/api/security') {
-      return sendJSON(res, 200, { proxyKey: config.proxyKey || '', publicBaseUrl: config.publicBaseUrl || '', authRequired: !!PROXY_KEY, exposeCatalog: !!config.exposeCatalog });
+      // 不回传 proxyKey 明文：管理密钥一旦被下游客户端读到即可用于改配置
+      return sendJSON(res, 200, {
+        hasProxyKey: !!config.proxyKey,
+        proxyKeyMasked: maskKey(config.proxyKey),
+        publicBaseUrl: config.publicBaseUrl || '',
+        authRequired: !!PROXY_KEY,
+        exposeCatalog: !!config.exposeCatalog,
+      });
     }
     if (req.method === 'POST' && p === '/api/security') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
-      if (body.proxyKey !== undefined) config.proxyKey = String(body.proxyKey).trim();
+      // 修改既有密钥时要求携带当前密钥（本机回环无密钥模式除外），防止下游客户端越权改配置
+      if (config.proxyKey && body.currentKey !== undefined && !safeEqual(String(body.currentKey), config.proxyKey)) {
+        return sendJSON(res, 401, { error: { message: 'currentKey 不正确' } });
+      }
+      if (body.proxyKey !== undefined) {
+        const next = String(body.proxyKey).trim();
+        // 传回脱敏值视为「不修改」
+        if (!isMasked(next)) config.proxyKey = next;
+      }
       if (body.publicBaseUrl !== undefined) config.publicBaseUrl = String(body.publicBaseUrl).trim().replace(/\/+$/, '');
       if (body.exposeCatalog !== undefined) config.exposeCatalog = !!body.exposeCatalog;
       saveConfig();
       PROXY_KEY = config.proxyKey || '';
-      return sendJSON(res, 200, { ok: true, proxyKey: config.proxyKey, publicBaseUrl: config.publicBaseUrl, authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), exposeCatalog: !!config.exposeCatalog });
+      return sendJSON(res, 200, {
+        ok: true,
+        hasProxyKey: !!config.proxyKey,
+        proxyKeyMasked: maskKey(config.proxyKey),
+        publicBaseUrl: config.publicBaseUrl,
+        authRequired: !!PROXY_KEY,
+        proxyBase: publicProxyBase(),
+        exposeCatalog: !!config.exposeCatalog,
+      });
     }
     if (req.method === 'POST' && p === '/api/validate-upstreams') {
       const { model } = JSON.parse(await readBody(req).then((b) => b.toString()));

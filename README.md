@@ -75,14 +75,53 @@ location / {
 }
 ```
 
+### 方式 C：作为 new-api 的上游（同机容器对接）
+
+如果你用 [new-api](https://github.com/QuantumNous/new-api) 做统一网关，本服务可以作为它的一个普通上游渠道。**钉上游的旋钮留在本服务的控制台，不需要在 new-api 侧写任何 `param_override`** —— 两边重复配置会互相干扰（`injectPrefs()` 会按本服务的 `perModel` 重新构造请求体，覆盖 new-api 注入的同名字段）。
+
+链路：`客户端 → new-api → cline-pass-switcher → Cline 网关`
+
+`docker-compose.yml` 已按此场景配好。关键是三者：加入 new-api 所在网络、容器内绑 `0.0.0.0`、设置 `PROXY_KEY`。
+
+```bash
+mkdir -p data && cp config.example.json data/config.json
+cp .env.example .env && sed -i 's/^PROXY_KEY=.*/PROXY_KEY=你的代理密钥/' .env
+docker compose up -d --build
+```
+
+在 new-api 后台新建渠道：
+
+| 字段 | 值 |
+|---|---|
+| 类型 | `Custom`（OpenAI 兼容） |
+| Base URL | `http://cline-pass-console:3123/v1`（容器名直连，容器内 DNS 解析） |
+| 密钥 | 与 `PROXY_KEY` 相同 |
+| 模型 | 点「获取模型列表」自动拉取；或用 `model_mapping` 把 `cline-pass/*` 映射成你想要的对外名 |
+
+若 new-api 不在 `new-api_default` 网络，两种办法：改 `.env` 里的 `NET_NAME`，或事后接入：
+
+```bash
+docker network connect <new-api的实际网络名> cline-pass-console
+```
+
+**行为差异（重要）**：本服务的「失败自动顺切下一个上游」是在**同一请求内**改写 `provider.only` 重发；new-api 的故障转移是换**渠道**。若要做到「同一模型、上游 A 挂了切上游 B」，在 new-api 建两个渠道（同模型、不同 `Priority`），或直接在本服务控制台配好「优先 + 回退」，由本服务内部完成切换。
+
+**本服务不发布端口到宿主机**。要访问控制台，可临时开 `ports` 映射，或：
+
+```bash
+docker exec -it cline-pass-console node -e "console.log('访问 http://127.0.0.1:3123/')"
+docker run --rm --network container:cline-pass-console curlimages/curl -s localhost:3123/api/meta
+```
+
 ### 环境变量
 
 | 变量 | 说明 |
 |---|---|
 | `CLINE_PASS_KEY` | 上游 Cline Pass API Key（无 config 时自动创建账号） |
-| `PROXY_KEY` | 下游代理密钥（客户端访问代理的凭据） |
+| `PROXY_KEY` | 下游代理密钥（客户端/new-api 访问代理的凭据）；**对外部署或容器对接必填** |
 | `PUBLIC_BASE_URL` | 门户展示的公网代理地址，如 `https://pass.example.com` |
-| `PORT` / `BIND_HOST` / `DATA_DIR` | 端口 / 绑定地址（容器内为 0.0.0.0）/ 配置目录 |
+| `PORT` / `BIND_HOST` / `DATA_DIR` | 端口 / 绑定地址（容器内必须 0.0.0.0）/ 配置目录 |
+| `NET_NAME` | 仅在 `docker-compose.yml` 中使用，指定 new-api 所在网络名 |
 
 环境变量在启动时覆盖 `config.json`；此后通过控制台保存设置，会以当前生效值写回文件。
 
@@ -185,10 +224,34 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 
 ---
 
-## 安全提醒
+## 安全模型
+
+鉴权分两层，理解这一点再决定怎么部署：
+
+**代理面（`/v1/*`、`/chat/completions`）** —— 给下游客户端调用。`proxyKey` 为空时放行，非空时校验 `Authorization: Bearer <key>`。
+
+**管理面（`/api/*`）** —— 读写账号池、代理密钥、模型配置。`proxyKey` 为空时**仅允许回环地址（127.0.0.1 / ::1）访问**，非回环来源一律 401；设置了 `proxyKey` 则要求携带凭据。`/api/meta` 例外，始终匿名可访问，仅供前端探测鉴权状态。
+
+这样设计的原因：未设密钥时若管理面也放行，任何能访问到端口的人都能读走账号池里的明文 `sk_` 密钥。
+
+**密钥脱敏**：`GET /api/accounts` 默认只回 `sk_********3456` 形式的掩码，需显式加 `?reveal=1` 才返回明文；`GET /api/security` 永不返回 `proxyKey` 明文。前端保存时若回传的是掩码值，服务端识别为「不修改」，不会把掩码写成真密钥。
+
+**密钥比较**使用 `crypto.timingSafeEqual`（先各自 sha256 成定长摘要），避免通过响应时间反推密钥。
+
+### 部署对照
+
+| 场景 | BIND_HOST | PROXY_KEY | 管理面可达性 |
+|---|---|---|---|
+| 本机自用 | `127.0.0.1`（默认） | 留空 | 回环免密钥，外部不可达 |
+| new-api 同机容器对接 | `0.0.0.0` | **必须设置** | 同网络容器凭密钥访问，不发布端口 |
+| 对外暴露（Caddy/Nginx） | `0.0.0.0` | **必须设置** | 凭密钥访问；未设密钥时反代来源将被拒绝 |
+
+⚠️ **对外部署必须设 `PROXY_KEY`**：经反向代理进来的请求来源是容器内网地址而非回环，未设密钥时管理面会直接拒绝，控制台将无法加载数据。
+
+### 其他提醒
 
 - `config.json` / `data/` 含明文密钥，已在 `.gitignore` 排除，**不要提交或分享**；
-- 对外部署务必设置 `proxyKey`（控制台可随时轮换）；
+- `metadata.json` 的 `history` 记录每次请求的模型、账号名、实际上游与耗时。若对外提供服务，该文件含业务调用痕迹，不要暴露控制台给终端用户；
 - 「重试博弈」`maxRetries > 0` 时会放大请求量，注意额度消耗。
 
 ## License

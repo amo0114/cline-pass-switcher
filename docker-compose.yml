@@ -1,11 +1,35 @@
+# 同机部署：new-api（容器）→ cline-pass-switcher（容器）
+#
+# 用法：
+#   1. mkdir -p data && cp config.example.json data/config.json
+#   2. 设置下游密钥：在 .env 里写 PROXY_KEY=<你的代理密钥>
+#   3. docker compose up -d --build
+#   4. new-api 新建渠道：类型 Custom，Base URL 填 http://cline-pass-console:3123/v1，Key 填 PROXY_KEY
+#
+# 网络接线（关键）：
+#   - 默认加入名为 `new-api_default` 的外部网络，new-api 容器可直接用容器名访问本服务
+#   - 如果你的 new-api 不在该网络，改 NET_NAME 或在 new-api 侧执行：
+#       docker network connect <new-api网络名> cline-pass-console
+#   - 本服务不发布端口到宿主机；控制台仅通过 `docker exec` 内的回环访问，
+#     或临时开启下面的 ports 映射（不建议长期开启）
 services:
   cline-pass-console:
     build: .
+    image: cline-pass-switcher:1.2.0
     container_name: cline-pass-console
     restart: unless-stopped
     environment:
       - DATA_DIR=/data
+      # 容器内必须绑 0.0.0.0，否则同网络的其他容器访问不到
+      - BIND_HOST=0.0.0.0
+      # 下游代理密钥：new-api 侧渠道的 Key 填同一个值；留空则仅回环地址可管理
+      - PROXY_KEY=${PROXY_KEY:-}
     volumes:
       - ./data:/data
-    ports:
-      - "127.0.0.1:3123:3123"
+    networks:
+      - ai-stack
+
+networks:
+  ai-stack:
+    external: true
+    name: ${NET_NAME:-new-api_default}

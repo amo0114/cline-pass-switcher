@@ -375,7 +375,7 @@ function renderCatalog() {
 }
 
 async function loadAll() {
-  const [models, accs, sec, meta] = await Promise.all([api('/api/models'), api('/api/accounts'), api('/api/security'), api('/api/meta')]);
+  const [models, accs, sec, meta] = await Promise.all([api('/api/models'), api('/api/accounts?reveal=1'), api('/api/security'), api('/api/meta')]);
   DATA = models;
   ACCS = accs;
   render();
@@ -385,7 +385,8 @@ async function loadAll() {
 }
 
 function renderSecurity(sec) {
-  $('#secProxyKey').value = sec.proxyKey || '';
+  // 服务端不再回传 proxyKey 明文：用掩码占位展示，用户不输入即表示不修改
+  $('#secProxyKey').value = sec.hasProxyKey ? (sec.proxyKeyMasked || '') : '';
   $('#secPublicBase').value = sec.publicBaseUrl || '';
   const badge = $('#secBadge');
   badge.textContent = sec.authRequired ? '鉴权已开启' : '鉴权已关闭';
@@ -401,18 +402,22 @@ async function saveExposeCatalog(v) {
 }
 
 async function saveSecurity() {
+  const input = $('#secProxyKey').value.trim();
   const payload = {
-    proxyKey: $('#secProxyKey').value.trim(),
+    // 掩码值原样回传，服务端识别为「不修改」
+    proxyKey: input,
     publicBaseUrl: $('#secPublicBase').value.trim(),
   };
   const r = await api('/api/security', payload);
   if (r.ok) {
     // 控制台鉴权与代理密钥同源：改完立即换新密钥，避免会话失效
-    if (r.proxyKey) { AUTH_KEY = r.proxyKey; localStorage.setItem('cps_key', r.proxyKey); }
+    if (input && !input.includes('********')) {
+      AUTH_KEY = input; localStorage.setItem('cps_key', input);
+    }
     renderSecurity(r);
     DATA.proxyBase = r.proxyBase;
     $('#proxyBase').textContent = '代理地址：' + r.proxyBase + '（点击复制）';
-    secMsg('已保存' + (r.authRequired ? '，鉴权开启' : '，鉴权已关闭（任何客户端都可访问代理）'));
+    secMsg('已保存' + (r.authRequired ? '，鉴权开启' : '，鉴权已关闭（仅回环地址可访问）'));
   } else secMsg(r.error?.message || '保存失败', true);
 }
 

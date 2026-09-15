@@ -1,18 +1,26 @@
-# All-in-one 部署：应用 + Caddy 自动 HTTPS
+# All-in-one 部署：应用 + Caddy 自动 HTTPS（对外暴露控制台）
+#
+# ⚠️ 对外暴露前必须设置 PROXY_KEY，否则管理面依赖「非回环即拒绝」策略：
+#    未设密钥时，经 Caddy 反代进来的请求其来源均为容器内网地址，管理面将拒绝服务。
+#    因此对外部署时 PROXY_KEY 是必填项。
+#
 # 用法：
 #   1. mkdir -p data && cp config.example.json data/config.json  （填入你的账号 key）
-#   2. 有域名：CPASS_DOMAIN=pass.example.com docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
+#   2. export PROXY_KEY=你的代理密钥
+#   3. 有域名：CPASS_DOMAIN=pass.example.com docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
 #      （把域名 A 记录指向服务器 IP，Caddy 自动向 Let's Encrypt 申请受信证书）
-#   3. 没有域名（仅 IP）：直接 docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
+#   4. 没有域名（仅 IP）：直接 docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
 #      （Caddy 使用自签证书，浏览器需信任一次；访问 https://服务器IP）
 services:
   app:
     build: ..
+    image: cline-pass-switcher:1.2.0
     container_name: cline-pass-console
     restart: unless-stopped
     environment:
       - DATA_DIR=/data
       - BIND_HOST=0.0.0.0
+      - PROXY_KEY=${PROXY_KEY:?对外部署必须设置 PROXY_KEY}
     volumes:
       - ../data:/data
     expose:
