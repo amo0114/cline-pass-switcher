@@ -14,9 +14,10 @@
 services:
   app:
     build: ..
-    image: cline-pass-switcher:1.2.0
+    image: cline-pass-switcher:1.2.2
     container_name: cline-pass-console
     restart: unless-stopped
+    init: true
     environment:
       - DATA_DIR=/data
       - BIND_HOST=0.0.0.0
@@ -31,7 +32,9 @@ services:
     container_name: cline-pass-caddy
     restart: unless-stopped
     depends_on:
-      - app
+      app:
+        # 等应用健康检查通过再启动反代，避免容器刚起来就对外 502
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"

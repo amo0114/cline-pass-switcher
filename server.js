@@ -53,17 +53,57 @@ const DEFAULT_CONFIG = {
   perModel: {},
 };
 
+// 原子写：先写临时文件并 fsync，再 rename 覆盖。裸 writeFileSync 被 SIGKILL / 磁盘满打断时会留下
+// 截断的半个 JSON，而 loadJson 的 fallback 会让账号池静默消失。mode 0o600：这两个文件含明文
+// 上游 API Key，默认 0644 会让同机其他用户可读。
+function writeFileAtomic(file, data) {
+  const tmp = `${file}.tmp`;
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+}
+
 function loadJson(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
+  } catch (e) {
+    // 文件不存在属正常首次启动；解析失败意味着数据损坏，必须报警并留证据，不能静默吞掉
+    if (e.code !== 'ENOENT') {
+      const bak = `${file}.corrupt-${Date.now()}`;
+      try { fs.copyFileSync(file, bak); } catch { /* 备份失败不阻塞启动 */ }
+      console.error(`[错误] ${path.basename(file)} 读取/解析失败（${e.message}）；已备份为 ${path.basename(bak)}，本次以默认值启动`);
+    }
     return fallback;
   }
 }
 const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
-const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+function saveConfig() {
+  try { writeFileAtomic(CONFIG_PATH, JSON.stringify(config, null, 2)); }
+  catch (e) { console.error(`[错误] config.json 写入失败：${e.message}`); }
+}
+// metadata.json 在每个代理请求结束时都会更新（history / 账号统计），同步全量写盘会阻塞事件循环；
+// 改成脏标记 + 500ms 去抖合并写入，退出前由 flushMetaSave 强制落盘。
+let metaDirty = false;
+let metaTimer = null;
+function flushMetaSave() {
+  if (metaTimer) { clearTimeout(metaTimer); metaTimer = null; }
+  if (!metaDirty) return;
+  metaDirty = false;
+  try { writeFileAtomic(META_PATH, JSON.stringify(META, null, 2)); }
+  catch (e) { console.error(`[错误] metadata.json 写入失败：${e.message}`); }
+}
+function saveMeta() {
+  metaDirty = true;
+  if (metaTimer) return;
+  metaTimer = setTimeout(() => { metaTimer = null; flushMetaSave(); }, 500);
+  if (metaTimer.unref) metaTimer.unref();
+}
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -188,14 +228,16 @@ async function fetchJSON(url, opts = {}, timeoutMs = 60000) {
 // ---------- OpenRouter 目录缓存与 slug 归一化 ----------
 async function orModelList() {
   if (META.orModelList && Date.now() - META.orModelsFetchedAt < 6 * 3600e3) return META.orModelList;
-  const { json } = await fetchJSON(`${OR_API}/models`);
+  const { json } = await fetchJSON(`${OR_API}/models`).catch(() => ({ json: null }));
   const ids = (json?.data || []).map((m) => m.id);
   if (ids.length) {
     META.orModelList = ids;
     META.orModelsFetchedAt = Date.now();
     saveMeta();
+    return ids;
   }
-  return ids;
+  // 抓取失败时回落到旧缓存，而不是返回空数组——否则探测结果里的端点明细会凭空消失
+  return META.orModelList || [];
 }
 const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -491,7 +533,9 @@ const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
 // 自动模式 only=已知上游-排除；preferred 钉住模式 order=[当前,...] 且 only=已知上游-排除（防止网关回退到被排除渠道）；
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
 function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
-  const b = JSON.parse(JSON.stringify(body));
+  // 顶层浅拷贝即可：下面只替换 provider / providerOptions 两个键，不会改动 body 的嵌套对象。
+  // 原来的 JSON 深拷贝会按尝试次数重复复制整份 messages（带图请求时开销明显）。
+  const b = { ...body };
   const exclude = (excludeList || []).filter((u) => u !== upstream);
   const meta = META.models[modelId] || {};
   const known = meta.upstreams || [];
@@ -553,10 +597,10 @@ function buildAttempts(modelId, cfg) {
 const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.stringify(e));
 
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
-// 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
+// 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换。
+// acc 由调用方传入：同一次客户端请求的整条故障转移链共用同一账号。
+async function attemptOnce(modelId, body, attempt, signal, acc) {
   const send = injectPrefs(body, modelId, attempt);
-  const acc = pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
@@ -574,8 +618,11 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
-async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000, account = null } = {}) {
   const attempts = buildAttempts(modelId, cfg);
+  // 账号在整条故障转移链上固定：轮询模式按「每个客户端请求」轮换，而不是按每次重试轮换，
+  // 否则一次请求内的重试会落到不同账号，计费/限流语义会变得不可预期。
+  const acc = account || pickAccount();
   const trace = [];
   const t0 = Date.now();
   let last = null;
@@ -592,7 +639,6 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       try {
         if (stream) {
           const send = injectPrefs(body, modelId, attempt);
-          const acc = pickAccount();
           let up = null;
           let netError = null;
           try {
@@ -659,7 +705,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, body, attempt, ctrl.signal, acc);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
@@ -688,7 +734,7 @@ async function handleChat(req, res) {
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream, account: pickAccount() });
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
@@ -707,6 +753,7 @@ async function handleChat(req, res) {
     });
     if (chain.streamHead) res.write(chain.streamHead);
     const buf = [];
+    let finalized = false;   // 正常收尾与中断两条路径只记录一次
     const tap = new Transform({
       transform(c, enc, cb) { buf.push(c); cb(null, c); },
       flush(cb) {
@@ -729,18 +776,43 @@ async function handleChat(req, res) {
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
         }
+        finalized = true;
         record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
         cb();
       },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    const src = Readable.fromWeb(up.body);
+    // 上游 SSE 中断、解码失败或客户端断连都会让管道 emit 'error'；未监听的 stream 'error'
+    // 会作为未捕获异常直接终止进程，这是生产中最容易被网络抖动触发的崩溃点。
+    const onPipeError = (e) => {
+      console.error(`[流式] 传输中断：${e?.message || e}`);
+      // 中断也要留痕：否则请求历史里这次调用会凭空消失，排查时看不到任何线索
+      if (!finalized) {
+        finalized = true;
+        record(modelId, {
+          provider: null, canonical: null, ms: Date.now() - t0, stream: true,
+          error: `流式传输中断：${e?.message || e}`, account: acc.name,
+          attempts: chain.trace.map((t) => t.upstream || 'auto'),
+        });
+      }
+      try { src.destroy(); } catch { /* 已销毁 */ }
+      try { tap.destroy(); } catch { /* 已销毁 */ }
+      try { res.destroy(); } catch { /* 已关闭 */ }
+    };
+    src.on('error', onPipeError);
+    tap.on('error', onPipeError);
+    res.on('error', onPipeError);
+    // 客户端提前断开时释放上游连接（onClientClose 已 abort fetch，这里兜底销毁 body 流）
+    res.on('close', () => { try { src.destroy(); } catch { /* 已销毁 */ } });
+    src.pipe(tap).pipe(res);
     return;
   }
 
   const { status, out, routing, acc } = chain;
   if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
-  // 客户端实际使用成功的新订阅模型自动收录进列表
-  if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
+  // 客户端实际使用成功的新订阅模型自动收录进列表。字符集与 fetchOfficialModels 保持一致，
+  // 避免任意 model 名进入 knownModels 后污染 /v1/models 与控制台渲染。
+  if (status === 200 && /^cline-pass\/[a-z0-9._-]+$/.test(String(modelId)) && !config.knownModels.includes(modelId)) {
     config.knownModels.push(modelId);
     saveConfig();
   }
@@ -767,8 +839,31 @@ async function handleChat(req, res) {
 }
 
 // ---------- HTTP 服务 ----------
+// 跨源策略：
+// - 管理面（/api/*）只允许同源。此前无条件回 Access-Control-Allow-Origin: * 时，任意网页都能
+//   fetch('http://127.0.0.1:3123/api/accounts?reveal=1') 读走全部明文上游 Key —— 因为未设 PROXY_KEY
+//   时管理面只校验回环地址，而浏览器发来的请求其 remoteAddress 正是 127.0.0.1。
+// - 代理面（/v1/*）保留跨源：浏览器里的第三方客户端（不同端口/域名）依赖它。
+function corsHeaders(req) {
+  const origin = req?.headers?.origin;
+  if (!origin) return {};                                  // curl / 服务端 SDK 不带 Origin
+  const host = req?.headers?.host || '';
+  if (origin === `http://${host}` || origin === `https://${host}`) {
+    return { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
+  }
+  return null;                                             // 跨源：不回 CORS 头，浏览器读不到响应体
+}
+// 跨源判定：Origin 与 Host 不同源，或浏览器明确标记 cross-site（DNS rebinding 兜底）
+function isCrossOrigin(req) {
+  if (req?.headers?.['sec-fetch-site'] === 'cross-site') return true;
+  const origin = req?.headers?.origin;
+  if (!origin) return false;
+  const host = req?.headers?.host || '';
+  return origin !== `http://${host}` && origin !== `https://${host}`;
+}
 function sendJSON(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+  const cors = corsHeaders(res.req);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...(cors || {}) });
   res.end(JSON.stringify(obj));
 }
 
@@ -778,6 +873,13 @@ async function catalog() {
   const ids = (json?.data || []).map((m) => m.id);
   if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
   return META.catalog || [];
+}
+
+// /v1/models 暴露的模型集合：默认只含订阅模型，exposeCatalog=true 时并入完整目录
+async function exposedModelIds() {
+  return config.exposeCatalog
+    ? [...new Set([...config.knownModels, ...(await catalog())])]
+    : [...new Set([...config.knownModels, ...Object.keys(config.perModel)])];
 }
 
 // 密钥脱敏：保留前缀与末 4 位，中间定长掩码（不泄漏原长度）
@@ -795,17 +897,35 @@ function isMasked(k) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
+  let url;
+  try {
+    url = new URL(req.url, 'http://x');
+  } catch {
+    return sendJSON(res, 400, { error: { message: 'malformed request url' } });
+  }
   const p = url.pathname;
   if (req.method === 'OPTIONS') {
+    // 管理面的跨源预检直接拒绝（同源请求不会触发预检）
+    if (p.startsWith('/api/') && isCrossOrigin(req)) {
+      res.writeHead(403);
+      return res.end();
+    }
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
+      ...(corsHeaders(req) || { 'Access-Control-Allow-Origin': '*' }),
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
       'Access-Control-Allow-Headers': '*',
     });
     return res.end();
   }
   try {
+    // 管理面跨源一律拒绝：即使本机回环免鉴权模式，也不允许其他站点读取账号池
+    if (p.startsWith('/api/') && isCrossOrigin(req)) {
+      return sendJSON(res, 403, { error: { message: 'cross-origin admin request denied' } });
+    }
+    // 健康检查：给 Docker healthcheck / 反向代理探活使用，不含任何敏感信息
+    if (req.method === 'GET' && p === '/healthz') {
+      return sendJSON(res, 200, { ok: true, configured: isConfigured(), uptime: Math.round(process.uptime()) });
+    }
     if (req.method === 'GET' && p === '/api/meta') {
       return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), configured: isConfigured() });
     }
@@ -879,16 +999,18 @@ const server = http.createServer(async (req, res) => {
       const accs = (Array.isArray(body.accounts) ? body.accounts : [])
         .map((a, i) => {
           const raw = String(a.key || '').trim();
-          // 前端未改动密钥时会回传脱敏值：按下标回填原密钥，避免把掩码写成真 key
+          // 前端未改动密钥时会回传脱敏值：按下标回填原密钥，避免把掩码写成真 key。
+          // （前端目前始终以 reveal=1 拉取明文，这条分支属防御性兜底。）
           const key = isMasked(raw) ? (prev[i]?.key || '') : raw;
+          // key 为空的行保留但标为停用，不再静默丢弃：用户可以暂时清空某行而不丢账号。
+          // 空 key 账号不会被 enabledAccounts() 选中，因此不影响代理行为。
           return {
             name: String(a.name || `账号${i + 1}`).slice(0, 50),
             key,
-            enabled: a.enabled !== false,
+            enabled: !!key && a.enabled !== false,
           };
-        })
-        .filter((a) => a.key);
-      if (!accs.length) return sendJSON(res, 400, { error: { message: '至少需要一个有效账号（key 非空）' } });
+        });
+      if (!accs.some((a) => a.key)) return sendJSON(res, 400, { error: { message: '至少需要一个有效账号（key 非空）' } });
       config.accounts = accs;
       config.accountMode = body.mode === 'roundrobin' ? 'roundrobin' : 'single';
       config.activeAccount = Math.min(Math.max(0, Number(body.active) || 0), accs.length - 1);
@@ -991,10 +1113,19 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (p === '/v1/models' || p === '/api/v1/models' || p === '/models')) {
       // 默认只暴露订阅模型，避免目录模型淹没客户端的模型选择器；exposeCatalog=true 时合并完整目录
-      const ids = config.exposeCatalog
-        ? [...new Set([...config.knownModels, ...(await catalog())])]
-        : [...new Set([...config.knownModels, ...Object.keys(config.perModel)])];
+      const ids = await exposedModelIds();
       return sendJSON(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model' })) });
+    }
+    // OpenAI 兼容的单模型查询：部分客户端与下游网关自检会请求 /v1/models/{id}，缺失会被判为渠道失效。
+    // 注意 id 本身含斜杠（cline-pass/xxx），不能用 [^/]+ 匹配。
+    const modelOne = /^\/(?:api\/)?v1\/models\/(.+)$/.exec(p);
+    if (req.method === 'GET' && modelOne) {
+      let id = modelOne[1];
+      try { id = decodeURIComponent(id); } catch { /* 非法转义则保留原样 */ }
+      if (!(await exposedModelIds()).includes(id)) {
+        return sendJSON(res, 404, { error: { message: `model not found: ${id}`, type: 'invalid_request_error' } });
+      }
+      return sendJSON(res, 200, { id, object: 'model', owned_by: 'cline-pass-switcher' });
     }
     if (CHAT_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
     return sendJSON(res, 404, { error: { message: `no route: ${req.method} ${p}` } });
@@ -1011,8 +1142,38 @@ server.on('error', (e) => {
   process.exit(1);
 });
 
+// 显式设置超时：Node 默认值偏宽松，慢速连接可以长时间占住 socket
+server.headersTimeout = 30000;      // 请求头必须在 30s 内收完
+server.requestTimeout = 300000;     // 单个请求整体上限（探测/校验类请求本身耗时较长）
+server.keepAliveTimeout = 65000;
+
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 server.listen(config.port, BIND_HOST, () => {
+  const shown = BIND_HOST === '0.0.0.0' ? '所有网卡' : BIND_HOST;
   console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
-  console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
+  console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1  （监听 ${shown}:${config.port}）`);
 });
+
+// 优雅关闭：Docker stop / systemd stop 默认会先发 SIGTERM，处理不好就是 SIGKILL 打断写盘。
+// 这里先停止接收新连接、放掉空闲 keep-alive，给在途请求留出收尾时间，并强制落盘 metadata.json。
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[${signal}] 正在关闭：停止接收新连接…`);
+  server.close(() => {
+    flushMetaSave();
+    console.log('[关闭] 已安全退出');
+    process.exit(0);
+  });
+  try { server.closeIdleConnections?.(); } catch { /* 旧版本 Node 无此方法 */ }
+  // 兜底：长连接/流式请求迟迟不结束时强制退出，但先保住配置与元数据
+  setTimeout(() => {
+    flushMetaSave();
+    console.error('[关闭] 等待超时，强制退出');
+    process.exit(0);
+  }, 10000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('exit', () => { try { flushMetaSave(); } catch { /* 尽力而为 */ } });

@@ -140,6 +140,16 @@ docker run --rm --network cliproxyapi_default curlimages/curl:latest \
 
 环境变量在启动时覆盖 `config.json`；此后通过控制台保存设置，会以当前生效值写回文件。
 
+### 探活与兼容端点
+
+| 端点 | 说明 |
+|---|---|
+| `GET /healthz` | 返回 `{ ok, configured, uptime }`。不鉴权、不含敏感信息，供容器 `HEALTHCHECK` 与反向代理探活 |
+| `GET /v1/models` | 模型列表。默认仅订阅模型，`exposeCatalog=true` 时并入完整目录 |
+| `GET /v1/models/{id}` | 单模型查询。部分 OpenAI 兼容客户端与下游网关自检会请求它，返回 404 会被判为渠道失效 |
+
+镜像内置 `HEALTHCHECK`（30s 间隔探测 `/healthz`），`deploy/docker-compose.all-in-one.yml` 里 Caddy 会等应用健康后再启动。
+
 ---
 
 ## 配置参考（config.json）
@@ -253,6 +263,12 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 
 **密钥比较**使用 `crypto.timingSafeEqual`（先各自 sha256 成定长摘要），避免通过响应时间反推密钥。
 
+**跨源访问（CORS）**：管理面 `/api/*` 只接受同源请求——带 `Origin` 且与 `Host` 不一致、或 `Sec-Fetch-Site: cross-site` 的请求一律 403，响应也不会回 `Access-Control-Allow-Origin`。
+
+这一层是必须的：未设密钥时管理面只靠「来源是否为回环地址」放行，而**浏览器发往 `127.0.0.1` 的请求，其来源正是回环**，仅凭这一点无法区分「本机控制台」与「用户浏览器里打开的任意网页」。缺了这层保护，任何网页都能用 `fetch('http://127.0.0.1:3123/api/accounts?reveal=1')` 读走账号池里的全部明文密钥。代理面 `/v1/*` 保留跨源，供浏览器中的第三方客户端使用——配置 `PROXY_KEY` 之后跨源方拿不到凭据，风险可控。
+
+⚠️ **反向代理必须透传原始 `Host`**（nginx 用 `proxy_set_header Host $host;`，Caddy 的 `reverse_proxy` 默认即保留）。同源判定以 `Origin` 与 `Host` 是否一致为准；若反代把 Host 改写成上游地址，同源请求会被误判为跨源而返回 403。
+
 ### 部署对照
 
 | 场景 | BIND_HOST | PROXY_KEY | 管理面可达性 |
@@ -266,8 +282,10 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 ### 其他提醒
 
 - `config.json` / `data/` 含明文密钥，已在 `.gitignore` 排除，**不要提交或分享**；
+- `config.json` 与 `metadata.json` 都以 `0600` 权限落盘，且写入走「临时文件 + fsync + rename」的原子替换：进程被 SIGKILL 也不会留下半个 JSON，退出前会强制 flush 元数据；
 - `metadata.json` 的 `history` 记录每次请求的模型、账号名、实际上游与耗时。若对外提供服务，该文件含业务调用痕迹，不要暴露控制台给终端用户；
-- 「重试博弈」`maxRetries > 0` 时会放大请求量，注意额度消耗。
+- `maxRetries` 已退役（旧配置里残留的值不再生效），故障转移由 `perModel[m].upstreams` 的有序列表驱动；注意候选列表里每个上游都可能各发一次请求；
+- 容器内以非 root（`node`，uid 1000）运行；入口脚本会在启动时把 `DATA_DIR` 的属主纠正为 `node` 后再降权，因此宿主机的 `./data` 无论由谁创建都不需要手工 `chown`。
 
 ## License
 

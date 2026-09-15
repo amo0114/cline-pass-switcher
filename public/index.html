@@ -269,6 +269,7 @@ function upstreamPanel(id, meta, cfg) {
   const detail = (meta && meta.upstreamDetail) || {};
   const selected = cfg.upstreams || [];
   const excSet = new Set(cfg.exclude || []);
+  const mid = escapeHtml(id);
   const rows = ups.map((u) => {
     const d = detail[u];
     const st = stMap[u]?.status;
@@ -277,22 +278,24 @@ function upstreamPanel(id, meta, cfg) {
     const isEx = excSet.has(u);
     const stTxt = st && ST_TAG[st] ? ST_TAG[st] : '';
     const stCls = ST_CLS[st] || 'unknown';
-    return `<div class="uprow${isEx ? ' excluded' : ''}" data-m="${id}" data-u="${u}" data-stat="${stTxt}" data-statcls="${stCls}">
+    const us = escapeHtml(u);
+    const dname = d ? escapeHtml(d.name || '') : '';
+    return `<div class="uprow${isEx ? ' excluded' : ''}" data-m="${mid}" data-u="${us}" data-stat="${stTxt}" data-statcls="${stCls}">
       <span class="upno" title="优先级顺序（尝试顺序）">${no >= 0 ? no + 1 : ''}</span>
-      <span class="upinfo"><span class="upslug mono">${u}</span><span class="upname" title="${d ? d.name : ''}">${d ? d.name : ''}${d && d.endpoints > 1 ? ' ×' + d.endpoints : ''}</span></span>
+      <span class="upinfo"><span class="upslug mono">${us}</span><span class="upname" title="${dname}">${dname}${d && d.endpoints > 1 ? ' ×' + d.endpoints : ''}</span></span>
       <span class="upstat ${isEx ? 'excl' : stCls}">${isEx ? '🚫已排除' : stTxt}</span>
-      <button class="pill${isSel ? ' prio-on' : ''}" title="优先：加入尝试序列（异常自动顺切下一个）；再点一次取消" onclick="toggleUp('${id}','sel','${u}',${isSel ? 'false' : 'true'})">优先</button>
-      <button class="pill${isEx ? ' excl-on' : ''}" title="排除：该上游永不被使用；再点一次取消" onclick="toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})">排除</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveUp('${id}','${u}')" title="上移提高优先级">↑</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveDown('${id}','${u}')" title="下移降低优先级">↓</button>
+      <button class="pill${isSel ? ' prio-on' : ''}" title="优先：加入尝试序列（异常自动顺切下一个）；再点一次取消" data-act="sel" data-on="${isSel ? 'false' : 'true'}">优先</button>
+      <button class="pill${isEx ? ' excl-on' : ''}" title="排除：该上游永不被使用；再点一次取消" data-act="excl" data-on="${isEx ? 'false' : 'true'}">排除</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" data-move="up" title="上移提高优先级">↑</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" data-move="down" title="下移降低优先级">↓</button>
     </div>`;
   }).join('');
   return `<details class="ups-wrap">
     <summary><span class="ups-sum">${summaryChips(cfg)}</span></summary>
     <div class="ups-panel">${rows || '<div class="empty">尚未探测到上游，先点「探测」</div>'}
       <div class="ups-tools">
-        <button class="ghost mini" onclick="bulkUp('${id}','all')" title="全部按可用状态排序加入优先序列">全选优先</button>
-        <button class="ghost mini" onclick="bulkUp('${id}','clear')" title="清空优先与排除（回到自动）">清空</button>
+        <button class="ghost mini" data-bulk="all" title="全部按可用状态排序加入优先序列">全选优先</button>
+        <button class="ghost mini" data-bulk="clear" title="清空优先与排除（回到自动）">清空</button>
         <span class="dim" style="font-size:11px; align-self:center;">点「优先」按序尝试（异常自动顺切）；点「排除」永不使用</span>
       </div>
     </div>
@@ -305,7 +308,7 @@ function summaryChips(cfg) {
   const exc = cfg.exclude || [];
   if (!ups.length && !exc.length) return '<span class="sum-auto">自动 · 网关智能选择</span>';
   let html = '';
-  for (let i = 0; i < Math.min(ups.length, 4); i++) html += `<span class="sum-chip">${i + 1}&nbsp;${ups[i]}</span>`;
+  for (let i = 0; i < Math.min(ups.length, 4); i++) html += `<span class="sum-chip">${i + 1}&nbsp;${escapeHtml(ups[i])}</span>`;
   if (ups.length > 4) html += `<span class="sum-chip sum-more">+${ups.length - 4}</span>`;
   if (exc.length) html += `<span class="sum-chip sum-ex">✕ ${exc.length}</span>`;
   return html;
@@ -315,15 +318,16 @@ function render() {
   $('#proxyBase').textContent = '代理地址：' + DATA.proxyBase + '（点击复制）';
   const rows = DATA.subscription.map((s) => {
     const m = s.meta;
+    const sid = escapeHtml(s.id);
     const ups = (m?.upstreams?.length ?? null);
-    const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">未探测</span>';
-    const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
-    const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${m.tier0.join(', ')}</div>` : '';
+    const last = m?.lastProvider ? `<span class="badge">${escapeHtml(m.lastProvider)}</span>` : '<span class="dim">未探测</span>';
+    const canon = m?.canonicalSlug ? `<span class="mono dim">${escapeHtml(m.canonicalSlug)}</span>` : '<span class="dim">—</span>';
+    const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${escapeHtml(m.tier0.join(', '))}</div>` : '';
     const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
-    return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
-      <td class="mono">${s.id}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
+    return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${sid}">
+      <td class="mono">${sid}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
       <td>${canon}</td>
       <td>${ups === null ? '<span class="dim">—</span>' : ups}</td>
       <td>${last}${m?.lastMs ? `<div class="dim" style="font-size:11px">${m.lastMs} ms</div>` : ''}</td>
@@ -331,11 +335,11 @@ function render() {
         ${upstreamPanel(s.id, m, s.config)}
       </td>
       <td>
-        <div><select onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
+        <div><select data-field="pinMode" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
           <option value="strict" ${mode === 'strict' ? 'selected' : ''}>严格钉住</option>
           <option value="preferred" ${mode === 'preferred' ? 'selected' : ''}>优先+回退</option>
         </select></div>
-        <select onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
+        <select data-field="sort" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
           <option value="" ${!sort ? 'selected' : ''}>网关智能选</option>
           <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
           <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
@@ -343,15 +347,15 @@ function render() {
         </select>
       </td>
       <td><div class="row-actions">
-        <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
-        <button class="ghost" onclick="test('${s.id}', this)">测试</button>
-        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
+        <button class="ghost" data-op="probe">探测</button>
+        <button class="ghost" data-op="test">测试</button>
+        <button class="ghost" data-op="validate" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
       </div></td>
     </tr>`;
   }).join('');
   $('#subBody').innerHTML = rows;
 
-  $('#testModel').innerHTML = DATA.subscription.map((s) => `<option value="${s.id}">${s.id}</option>`).join('');
+  $('#testModel').innerHTML = DATA.subscription.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.id)}</option>`).join('');
   onTestModelChange();
 
   $('#catSummary').textContent = `展开（共 ${DATA.catalogCount} 个目录模型）`;
@@ -368,9 +372,10 @@ function renderCatalog() {
   $('#catBody').innerHTML = list.map((id) => {
     const m = DATA.subscription.find((s) => s.id === id)?.meta;
     const pinnable = id.includes(':free');
-    return `<tr><td class="mono">${id}</td><td>${pinnable ? '<span class="badge green">:free 可精确钉住</span>' : '<span class="badge orange">规划器管理</span>'}</td>
-    <td>${m?.lastProvider ? '<span class="badge">' + m.lastProvider + '</span>' : ''}</td>
-    <td><button class="ghost" onclick="probe('${id}', this)">探测</button></td></tr>`;
+    const cid = escapeHtml(id);
+    return `<tr><td class="mono">${cid}</td><td>${pinnable ? '<span class="badge green">:free 可精确钉住</span>' : '<span class="badge orange">规划器管理</span>'}</td>
+    <td>${m?.lastProvider ? '<span class="badge">' + escapeHtml(m.lastProvider) + '</span>' : ''}</td>
+    <td><button class="ghost" data-op="probe" data-m="${cid}">探测</button></td></tr>`;
   }).join('') || '<tr><td class="empty">无匹配</td></tr>';
 }
 
@@ -470,11 +475,11 @@ async function fetchOfficial(btn) {
     el.style.display = 'block';
     el.innerHTML = `<div class="kvs">
       <div>拉取时间 <b>${new Date().toLocaleTimeString()}</b></div>
-      <div>来源 <b>${r.sources.join(' + ') || '无可用来源'}</b></div>
+      <div>来源 <b>${escapeHtml(r.sources.join(' + ')) || '无可用来源'}</b></div>
       <div>官方清单 <b>${r.found} 个</b></div>
       <div>新增 <b class="${r.added.length ? 'match' : 'dim'}">${r.added.length} 个</b></div>
       <div>合并后 <b>${r.knownModels.length} 个</b></div>
-    </div>${r.added.length ? '✔ 检测到新模型，已加入下方列表并高亮显示：' + r.added.join('、') : '✔ 清单已是最新：官方渠道 ' + r.found + ' 个模型均已覆盖，现有 ' + r.knownModels.length + ' 个订阅模型保持不变。'}`;
+    </div>${r.added.length ? '✔ 检测到新模型，已加入下方列表并高亮显示：' + escapeHtml(r.added.join('、')) : '✔ 清单已是最新：官方渠道 ' + r.found + ' 个模型均已覆盖，现有 ' + r.knownModels.length + ' 个订阅模型保持不变。'}`;
     await loadAll();
     setTimeout(() => { LAST_ADDED = []; }, 6000);
   } catch (e) {
@@ -527,13 +532,13 @@ function showTest(r, model, target) {
   const hit = !targets.length || r.actual === targets[0];
   const hitExcluded = Array.isArray(r.exclude) && r.exclude.length && r.exclude.includes(r.actual);
   el.innerHTML = `<div class="kvs">
-      <div>模型 <b class="mono">${model}</b></div>
-      <div>目标上游 <b>${targets.length ? targets.join(' → ') : '自动'}</b></div>
-      <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
+      <div>模型 <b class="mono">${escapeHtml(model)}</b></div>
+      <div>目标上游 <b>${targets.length ? escapeHtml(targets.join(' → ')) : '自动'}</b></div>
+      <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${escapeHtml(r.actual || '未知')}</b></div>
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
-    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
-    <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
+    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${escapeHtml(r.actual)}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
+    <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${escapeHtml(r.canonicalSlug || '—')}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
 }
 
 // —— perModel 配置保存：POST 完整字段（upstreams + exclude 一起），UI 由调用方乐观更新 ——
@@ -576,7 +581,7 @@ function updateRowUi(id) {
   const cfg = s.config;
   const selected = cfg.upstreams || [];
   const excSet = new Set(cfg.exclude || []);
-  const tr = document.querySelector(`#subBody tr[data-id="${id}"]`);
+  const tr = [...document.querySelectorAll('#subBody tr')].find((r) => r.dataset.id === id);
   if (!tr) return render();
   tr.querySelectorAll('.uprow').forEach((row) => {
     const u = row.dataset.u;
@@ -585,11 +590,11 @@ function updateRowUi(id) {
     const pills = row.querySelectorAll('.pill');
     if (pills[0]) {
       pills[0].classList.toggle('prio-on', no >= 0);
-      pills[0].setAttribute('onclick', `toggleUp('${id}','sel','${u}',${no >= 0 ? 'false' : 'true'})`);
+      pills[0].dataset.on = no >= 0 ? 'false' : 'true';
     }
     if (pills[1]) {
       pills[1].classList.toggle('excl-on', isEx);
-      pills[1].setAttribute('onclick', `toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})`);
+      pills[1].dataset.on = isEx ? 'false' : 'true';
     }
     row.classList.toggle('excluded', isEx);
     row.querySelector('.upno').textContent = no >= 0 ? String(no + 1) : '';
@@ -637,9 +642,6 @@ function moveUpDown(id, u, dir) {
   updateRowUi(id);
   saveModelCfg(id, { upstreams: ups });
 }
-const moveUp = (id, u) => moveUpDown(id, u, -1);
-const moveDown = (id, u) => moveUpDown(id, u, 1);
-
 // 批量：'all'=按可用状态排序全部加入优先；'clear'=清空优先与排除（回到自动）
 function bulkUp(id, action) {
   const s = DATA.subscription.find((x) => x.id === id);
@@ -659,18 +661,22 @@ function bulkUp(id, action) {
 async function loadHistory() {
   const { history } = await api('/api/history');
   $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${h.model}</td>
-      <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
-      <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
-      <td class="mono dim">${h.canonical || '—'}</td>
+      <td>${fmt(h.ts)}</td><td class="mono">${escapeHtml(h.model)}</td>
+      <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td>${h.provider ? '<span class="badge">' + escapeHtml(h.provider) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td class="mono dim">${escapeHtml(h.canonical || '—')}</td>
       <td>${h.ms ?? '—'} ms</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
+      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? escapeHtml(t) : `${escapeHtml(t.upstream || 'auto')}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
     </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
 }
 
 let ACCS = null;
-const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// 所有插入 HTML 的动态值都必须过这里：上游显示名来自第三方响应（OpenRouter 的 provider_name），
+// 模型名可经 /v1/chat/completions 自动收录，两者都不能当作可信内容。
+const escapeHtml = (s) => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 function renderAccounts() {
   if (!ACCS) return;
@@ -687,8 +693,8 @@ function renderAccounts() {
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
       <td><div class="row-actions">
-        <button class="ghost" onclick="testAccount(${i}, this)">测试</button>
-        <button class="ghost" onclick="delAccount(${i})">删除</button>
+        <button class="ghost" data-op="testacc" data-i="${i}">测试</button>
+        <button class="ghost" data-op="delacc" data-i="${i}">删除</button>
       </div></td>
     </tr>`;
   }).join('');
@@ -757,6 +763,39 @@ function accMsg(msg, isErr) {
 
 let statusTimer;
 function status(msg) { $('#status').textContent = msg; clearTimeout(statusTimer); statusTimer = setTimeout(() => $('#status').textContent = '', 6000); }
+
+// ——— 事件委托 ———
+// 动态行内的操作按钮不再把模型 ID / 上游 slug 拼进 onclick 字符串：那些值来自第三方响应
+// 以及客户端可自选的模型名，拼进 JS 字符串上下文即使做了 HTML 转义也不安全。
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const row = btn.closest('.uprow');
+  if (row && btn.dataset.act) { toggleUp(row.dataset.m, btn.dataset.act, row.dataset.u, btn.dataset.on === 'true'); return; }
+  if (row && btn.dataset.move) { moveUpDown(row.dataset.m, row.dataset.u, btn.dataset.move === 'up' ? -1 : 1); return; }
+  const tr = btn.closest('#subBody tr');
+  if (tr && btn.dataset.bulk) { bulkUp(tr.dataset.id, btn.dataset.bulk); return; }
+  if (tr && btn.dataset.op) {
+    if (btn.dataset.op === 'probe') probe(tr.dataset.id, btn);
+    else if (btn.dataset.op === 'test') test(tr.dataset.id, btn);
+    else if (btn.dataset.op === 'validate') validate(tr.dataset.id, btn);
+    return;
+  }
+  if (btn.closest('#catBody') && btn.dataset.op === 'probe') { probe(btn.dataset.m, btn); return; }
+  if (btn.closest('#accBody') && btn.dataset.op) {
+    const i = Number(btn.dataset.i);
+    if (btn.dataset.op === 'testacc') testAccount(i, btn);
+    else if (btn.dataset.op === 'delacc') delAccount(i);
+  }
+});
+
+// 模式 / 排序下拉（原本用内联 onchange，同样改为委托）
+document.addEventListener('change', (e) => {
+  const sel = e.target;
+  if (sel?.tagName !== 'SELECT' || !sel.dataset.field) return;
+  const tr = sel.closest('tr');
+  if (tr?.dataset.id) saveCfg(tr.dataset.id, sel.dataset.field, sel.value);
+});
 
 $('#proxyBase').onclick = () => navigator.clipboard.writeText(DATA.proxyBase).then(() => status('已复制代理地址'));
 $('#testModel').addEventListener('change', onTestModelChange);

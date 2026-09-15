@@ -25,9 +25,11 @@
 services:
   cline-pass-console:
     build: .
-    image: cline-pass-switcher:1.2.1
+    image: cline-pass-switcher:1.2.2
     container_name: cline-pass-console
     restart: unless-stopped
+    # 注入 init 进程：正确转发 SIGTERM，让应用有机会优雅关闭并落盘 metadata.json
+    init: true
     environment:
       - DATA_DIR=/data
       # 容器内必须绑 0.0.0.0，否则同网络的其他容器访问不到
