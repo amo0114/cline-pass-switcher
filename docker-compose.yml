@@ -11,13 +11,14 @@
 #   （点「获取模型列表」可自动拉取模型）
 #
 # 网络接线（二选一）：
-#   A. 让本服务加入 new-api 所在网络（默认方式，推荐）：
-#      在 .env 里设置 NET_NAME=<new-api的网络名>，先确保该网络存在：
-#        docker network ls | grep new-api
-#      若网络名不符，compose 启动会报 "network ... declared as external, but could not be found"。
-#   B. 保持默认独立网络，事后把本容器接入 new-api 网络：
+#   A. 让本服务加入 new-api/cliproxyapi 所在网络（默认方式，推荐）：
+#      当前默认已设为 cliproxyapi_default。若你的环境网络名不同，
+#      在 .env 里设置 NET_NAME=<实际网络名>（先 docker network ls 确认）。
+#      注意：本 compose 会把该网络声明为 external，网络名填错或不存在时启动会报
+#      "network ... declared as external, but could not be found" 并中止。
+#   B. 保持独立网络，事后把本容器接入目标网络：
 #        docker compose up -d
-#        docker network connect <new-api的网络名> cline-pass-console
+#        docker network connect cliproxyapi_default cline-pass-console
 #
 # 控制台访问：本服务不发布端口到宿主机（仅同网络容器可达）。
 #   如需从本机浏览器访问控制台，临时取消下面 ports 注释后重启；用完记得注释回去。
@@ -42,4 +43,5 @@ services:
 
 networks:
   ai-stack:
-    name: ${NET_NAME:-cline-pass-net}
+    external: true
+    name: ${NET_NAME:-cliproxyapi_default}

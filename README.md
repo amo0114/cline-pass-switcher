@@ -91,32 +91,29 @@ vi .env                     # 设置 PROXY_KEY（必填）
 docker compose up -d --build
 ```
 
-网络接线二选一，**注意选错会启动失败**：
-
-**A. 加入 new-api 的网络（推荐）** —— 先在 `.env` 里设 `NET_NAME=<new-api的网络名>`：
+网络接线：本服务默认加入 `cliproxyapi_default` 网络（已在 `docker-compose.yml` 中设为默认值）。
 
 ```bash
-docker network ls | grep -i new-api        # 确认网络名，常见为 new-api_default 或 <项目名>_default
-echo 'NET_NAME=你的网络名' >> .env
-docker compose up -d --build
+docker network ls | grep -i cliproxyapi     # 确认网络存在
 ```
 
-若网络名填错或不存在，compose 会报 `network ... declared as external, but could not be found` 并中止。
+若你的环境网络名不同，在 `.env` 里改 `NET_NAME=<实际网络名>`。**该网络声明为 external，名称填错或不存在时 compose 会报 `network ... declared as external, but could not be found` 并中止**（这是刻意设计：宁可明确报错，也不要静默起在错误的网络里）。
 
-**B. 先独立启动，再接入 new-api 网络** —— 适合不确定网络名的情况：
+如果不确定网络名，也可以先独立启动再接入：
 
 ```bash
 docker compose up -d --build
-docker network connect <new-api的网络名> cline-pass-console
+docker network connect cliproxyapi_default cline-pass-console
 ```
 
-接线完成后验证互通（把 `<网络名>` 换成实际值）：
+启动后验证互通：
 
 ```bash
-docker run --rm --network <网络名> curlimages/curl:latest \
+docker run --rm --network cliproxyapi_default curlimages/curl:latest \
   -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $PROXY_KEY" \
   http://cline-pass-console:3123/v1/models
 # 返回 200 即通
+```
 
 在 new-api 后台新建渠道：
 
