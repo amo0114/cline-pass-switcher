@@ -221,6 +221,53 @@ client.messages.create(model="cline-pass/deepseek-v4.1-flash", max_tokens=1024,
 
 ---
 
+## 升级已有部署
+
+拉取新代码后重建镜像并重启即可，**数据不会丢**——账号池与请求历史都在 bind mount 的 `data/` 卷里，不在镜像内。
+
+```bash
+cd /path/to/cline-pass-switcher
+git pull
+
+# 方式 A（docker-compose.yml，new-api 同机对接）
+docker compose up -d --build
+
+# 方式 A'（all-in-one + Caddy）
+docker compose -f deploy/docker-compose.all-in-one.yml up -d --build
+
+# 方式 B（自带 nginx/Caddy 反代）：同上，用对应的 compose 文件
+```
+
+几个要点：
+
+- **必须带 `--build`**：`docker compose up -d` 单独执行不会重建镜像，代码不会更新。
+- **不需要 `down`**：`up -d --build` 会重建镜像并重启容器，`data/` 卷内容保持不变。加 `down` 反而会短暂中断服务。
+- **`.env` 不受影响**：它在 `.gitignore` 中，`git pull` 不会覆盖，`PROXY_KEY` 等设置照旧。
+- **`data/config.json` 不受影响**：宿主机文件，不在版本控制内。容器入口脚本会在启动时把 `data/` 属主纠正为 node 用户再降权运行，属主变化不会导致配置读不到。
+- **失败时回滚**：镜像标签是版本化的（如 `cline-pass-switcher:1.3.0`），旧镜像标签仍在本地时，把 compose 里的 `image:` 改回旧标签再 `docker compose up -d` 即可回滚。
+
+升级后确认新协议可用：
+
+```bash
+# OpenAI 兼容（原有）
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $PROXY_KEY" \
+  http://127.0.0.1:3123/v1/models
+
+# Anthropic Messages（1.3.0 新增）
+curl -s -X POST http://127.0.0.1:3123/v1/messages \
+  -H "x-api-key: $PROXY_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+
+# OpenAI Responses（1.3.0 新增）
+curl -s -X POST http://127.0.0.1:3123/v1/responses \
+  -H "Authorization: Bearer $PROXY_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"cline-pass/deepseek-v4.1-flash","input":"hi","max_output_tokens":64}'
+```
+
+> 从 1.2.x 升级到 1.3.0 无破坏性变更：原有 `/v1/chat/completions`、控制台配置与 `config.json` 结构全部兼容，`perModel` 等配置字段未改动。
+
+---
+
 ## 配置参考（config.json）
 
 | 字段 | 说明 |

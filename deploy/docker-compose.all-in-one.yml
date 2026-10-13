@@ -14,7 +14,7 @@
 services:
   app:
     build: ..
-    image: cline-pass-switcher:1.2.2
+    image: cline-pass-switcher:1.3.0
     container_name: cline-pass-console
     restart: unless-stopped
     init: true

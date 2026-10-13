@@ -1,7 +1,7 @@
 {
   "name": "cline-pass-switcher",
-  "version": "1.2.2",
-  "description": "Cline Pass 上游控制台：枚举/校验/钉住订阅模型背后的上游渠道，账号池轮询，OpenAI 兼容代理（零依赖 Node）",
+  "version": "1.3.0",
+  "description": "Cline Pass 上游控制台：枚举/校验/钉住订阅模型背后的上游渠道，账号池轮询，OpenAI / Anthropic / Responses 三协议兼容代理（零依赖 Node）",
   "private": false,
   "license": "MIT",
   "type": "module",
