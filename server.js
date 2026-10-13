@@ -191,10 +191,14 @@ function authOK(req) {
   if (!PROXY_KEY) return true;
   const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
   const admin = String(req.headers['x-admin-key'] || '').trim();
-  // 两侧都做恒定时间比较，且不短路，避免通过响应时间区分命中方式
+  // Anthropic SDK 与 Claude Code 用 x-api-key 而非 Authorization，缺这条会导致
+  // /v1/messages 在设了 proxyKey 的部署上直接 401。
+  const apiKey = String(req.headers['x-api-key'] || '').trim();
+  // 各分支都做恒定时间比较，且不短路，避免通过响应时间区分命中方式
   const okBearer = bearer ? safeEqual(bearer, PROXY_KEY) : false;
   const okAdmin = admin ? safeEqual(admin, PROXY_KEY) : false;
-  return okBearer || okAdmin;
+  const okApiKey = apiKey ? safeEqual(apiKey, PROXY_KEY) : false;
+  return okBearer || okAdmin || okApiKey;
 }
 function adminOK(req) {
   if (PROXY_KEY) return authOK(req);
@@ -496,6 +500,785 @@ function record(modelId, info) {
 // ---------- 聊天代理 ----------
 const CHAT_PATHS = new Set(['/chat/completions', '/v1/chat/completions', '/api/v1/chat/completions']);
 
+// Anthropic Messages API 入站路径。上游（api.cline.bot）实测只有 OpenAI 兼容的
+// /chat/completions：/messages 与 /responses 均返回与任意不存在路径逐字节一致的 404
+// （md5 对照 + 带 key 的 OPTIONS 不返回 Allow 头 + 官方文档 Endpoints 章节仅列
+// Chat Completions）。因此这里做本地协议转换，让 Anthropic SDK / Claude Code 直接接入。
+const ANTHROPIC_PATHS = new Set(['/v1/messages', '/api/v1/messages']);
+
+// OpenAI Responses API 入站路径（给 Codex 等客户端用）。
+// 上游同样没有 /responses（与任意不存在路径 404 同形），因此本地做协议转换。
+const RESPONSES_PATHS = new Set(['/v1/responses', '/api/v1/responses']);
+
+// Responses 的 input item 类型 → Chat 消息的映射基础。
+// 上游工具白名单（实测自 400 discriminator 报错）：function | custom |
+// vercel:{browserbase_fetch,browserbase_search,exa_search,parallel_search,perplexity_search,tako_search}。
+// 注意：OpenAI 原生的 web_search / file_search / code_interpreter / computer_use_preview
+// 全部被上游拒绝；搜索类能力须映射到 vercel: 前缀的工具名。
+const RESPONSES_SEARCH_TOOL_MAP = {
+  web_search: 'vercel:exa_search',
+  web_search_preview: 'vercel:exa_search',
+  web_search_preview_2025_03_11: 'vercel:exa_search',
+};
+// 上游无对应实现的内置工具：明确报错，而不是静默丢弃（静默丢弃会让客户端行为不可预期）
+const RESPONSES_UNSUPPORTED_TOOLS = new Set(['file_search', 'code_interpreter', 'computer_use_preview', 'image_generation', 'local_shell', 'mcp']);
+
+// reasoning.effort → 上游 reasoning_effort。上游实测四种写法均被接受，
+// 这里统一用 reasoning_effort（最直白的 OpenAI 风格写法）。
+const REASONING_EFFORT = new Set(['low', 'medium', 'high']);
+
+// Responses 请求体 → Chat Completions 请求体。
+//
+// 关键差异：
+// - input 可以是字符串，也可以是 item 数组（message / function_call / function_call_output /
+//   reasoning 等混合）；
+// - instructions 是顶层字段，映射为第一条 system；
+// - content part 的 type 叫 input_text / output_text / input_image，且 image 直接给 url 或
+//   data URL（不像 Anthropic 要嵌套 source）；
+// - tools[].type === "function" 时 parameters 在顶层（不带 function 包装层），而上游要求
+//   {"type":"function","function":{...}} 包装层，必须调整；
+// - custom 工具（apply_patch）不能透传：上游虽接受该形状，但模型只把调用写成正文 markdown
+//   （tool_calls: null），客户端无法解析。此处降级为带 input 参数的 function，
+//   实测可稳定得到结构化 tool_calls；响应侧再还原成 custom_tool_call。
+function responsesToChat(b, customToolNames = new Set()) {
+  const messages = [];
+  if (typeof b.instructions === 'string' && b.instructions) {
+    messages.push({ role: 'system', content: b.instructions });
+  }
+  const pushContent = (role, content) => {
+    if (typeof content === 'string') {
+      messages.push({ role, content });
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    const parts = [];
+    for (const c of content) {
+      if (!c || typeof c !== 'object') continue;
+      switch (c.type) {
+        case 'input_text':
+        case 'output_text':
+        case 'text':
+          if (c.text) parts.push({ type: 'text', text: c.text });
+          break;
+        case 'input_image':
+          // Responses 的图片是扁平的 url / image_url 字段，直接转 Chat 的 image_url
+          if (c.image_url) parts.push({ type: 'image_url', image_url: { url: c.image_url } });
+          else if (c.url) parts.push({ type: 'image_url', image_url: { url: c.url } });
+          break;
+        case 'refusal':
+          if (c.refusal) parts.push({ type: 'text', text: c.refusal });
+          break;
+        default:
+          break;
+      }
+    }
+    if (parts.length) messages.push({ role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts });
+  };
+
+  if (typeof b.input === 'string') {
+    pushContent('user', b.input);
+  } else if (Array.isArray(b.input)) {
+    // 历史 items 按序归并：连续的同类 item 合并，function_call/output 独立成消息
+    for (const it of b.input) {
+      if (!it || typeof it !== 'object') continue;
+      // 官方 SDK（@ai-sdk/openai 的 responses）发出的 message item 不带 type 字段，
+      // 形如 {"role":"user","content":[{"type":"input_text",...}]}。
+      // 只按 it.type === 'message' 分支匹配会静默丢弃这类 item，导致上游收到空 messages
+      // 并报 400 "At least one message is required"。因此以 role 存在与否兜底判定。
+      const kind = it.type || (it.role ? 'message' : '');
+      switch (kind) {
+        case 'message':
+          pushContent(it.role === 'assistant' ? 'assistant' : it.role === 'system' ? 'system' : 'user', it.content);
+          break;
+        case 'function_call': {
+          // Responses 把每次调用拆成独立 item；Chat 要求聚合进 assistant.tool_calls
+          const last = messages[messages.length - 1];
+          const call = { id: it.call_id || it.id, type: 'function', function: { name: it.name, arguments: it.arguments || '{}' } };
+          if (last && last.role === 'assistant' && Array.isArray(last.tool_calls)) last.tool_calls.push(call);
+          else messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+          break;
+        }
+        case 'custom_tool_call': {
+          // custom 工具（apply_patch）的调用：上游把它当普通工具调用回传，
+          // 这里按同名 function 形式回灌，保证历史可续接
+          const last = messages[messages.length - 1];
+          const call = { id: it.call_id || it.id, type: 'function', function: { name: it.name, arguments: JSON.stringify({ input: it.input ?? '' }) } };
+          if (last && last.role === 'assistant' && Array.isArray(last.tool_calls)) last.tool_calls.push(call);
+          else messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+          break;
+        }
+        case 'function_call_output':
+        case 'custom_tool_call_output': {
+          const out = typeof it.output === 'string' ? it.output : JSON.stringify(it.output ?? '');
+          messages.push({ role: 'tool', tool_call_id: it.call_id || it.id, content: out });
+          break;
+        }
+        case 'reasoning': {
+          // reasoning item 必须能回传给模型（Codex 靠它续接思考链）。
+          // 上游实测：assistant 消息上的 reasoning 字段被接受并影响后续推理。
+          const last = messages[messages.length - 1];
+          const text = (it.summary || []).map((s) => s?.text || '').join('') || it.content || '';
+          if (last && last.role === 'assistant') last.reasoning = text;
+          else messages.push({ role: 'assistant', content: '', reasoning: text });
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  const out = { model: b.model, messages, stream: !!b.stream };
+  if (b.max_output_tokens != null) out.max_tokens = b.max_output_tokens;
+  else if (b.max_tokens != null) out.max_tokens = b.max_tokens;
+  if (b.temperature != null) out.temperature = b.temperature;
+  if (b.top_p != null) out.top_p = b.top_p;
+  // reasoning.effort 或顶层 reasoning_effort 都接受
+  const effort = b.reasoning?.effort || b.reasoning_effort;
+  if (effort && REASONING_EFFORT.has(effort)) out.reasoning_effort = effort;
+  if (Array.isArray(b.tools) && b.tools.length) {
+    const tools = [];
+    for (const t of b.tools) {
+      if (!t || typeof t !== 'object') continue;
+      const ty = String(t.type || 'function');
+      if (ty === 'function') {
+        // Responses 的 parameters 在顶层，上游要 function 包装层
+        tools.push({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters || t.input_schema || { type: 'object', properties: {} }, ...(t.strict != null ? { strict: t.strict } : {}) } });
+      } else if (ty === 'custom') {
+        // custom 工具（apply_patch）不能直接透传上游：
+        // 实测 {"type":"custom","name":"apply_patch"} 虽被接受，但模型不会产生结构化调用，
+        // 而是把调用写成正文 markdown（tool_calls: null），客户端无法解析。
+        // 降级为带 input 参数的 function 后，模型稳定返回结构化 tool_calls，
+        // 且参数正是 Codex 的 patch 格式：{"input":"*** Begin Patch\n..."}。
+        // 响应侧再由 chatToResponses 还原成 custom_tool_call（见 customToolNames）。
+        tools.push({
+          type: 'function',
+          function: {
+            name: t.name,
+            description: t.description || `${t.name} (free-form tool; the argument goes into the "input" field)`,
+            parameters: { type: 'object', properties: { input: { type: 'string', description: 'Free-form input for this tool.' } }, required: ['input'] },
+          },
+        });
+        customToolNames.add(t.name);
+      } else if (RESPONSES_SEARCH_TOOL_MAP[ty]) {
+        tools.push({ type: RESPONSES_SEARCH_TOOL_MAP[ty] });
+      } else if (RESPONSES_UNSUPPORTED_TOOLS.has(ty)) {
+        throw new ResponsesToolError(ty);
+      }
+    }
+    if (tools.length) out.tools = tools;
+    if (b.tool_choice) {
+      const tc = b.tool_choice;
+      if (typeof tc === 'string') out.tool_choice = tc === 'required' ? 'required' : tc;
+      else if (tc.type === 'function') out.tool_choice = { type: 'function', function: { name: tc.name } };
+    }
+  }
+  return out;
+}
+
+// 上游无法提供的内置工具：抛出让调用方转成 Responses 形状的错误
+class ResponsesToolError extends Error {
+  constructor(toolType) {
+    super(`unsupported tool type: ${toolType}（上游仅支持 function、custom 与搜索类 vercel:* 工具）`);
+    this.toolType = toolType;
+  }
+}
+
+// Responses 响应 id：resp_ 前缀，与官方一致
+function responsesId() {
+  return `resp_${crypto.randomBytes(12).toString('hex')}`;
+}
+function responsesItemId(prefix) {
+  return `${prefix}_${crypto.randomBytes(10).toString('hex')}`;
+}
+
+// Chat 非流式响应 → Responses 响应体。
+// 上游非流式被 {"data":...} 包裹，parseRouting 已解包。
+// reasoning → reasoning item（Codex 依赖；上游字段名实测为 reasoning 而非 reasoning_content）；
+// tool_calls → function_call item；content → message item（含 output_text）。
+function chatToResponses(json, modelId, { previousResponseId = null, customToolNames = new Set() } = {}) {
+  const d = json?.data && json.data.choices ? json.data : json;
+  const msg = d?.choices?.[0]?.message || {};
+  const finish = d?.choices?.[0]?.finish_reason;
+  const u = d?.usage || {};
+  const out = [];
+  const reasoningText = msg.reasoning || '';
+  if (reasoningText) {
+    out.push({ id: responsesItemId('rs'), type: 'reasoning', summary: [{ type: 'summary_text', text: reasoningText }] });
+  }
+  const content = typeof msg.content === 'string' ? msg.content : Array.isArray(msg.content) ? msg.content.map((p) => p?.text || '').join('') : '';
+  const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+  // 有工具调用时 content 常为 null，此时不产生空 message item（与官方一致）
+  if (content || !toolCalls.length) {
+    out.push({
+      id: responsesItemId('msg'),
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: content ? [{ type: 'output_text', text: content, annotations: [] }] : [],
+    });
+  }
+  for (const t of toolCalls) {
+    const name = t.function?.name || 'unknown';
+    let args = t.function?.arguments || '{}';
+    // custom 工具（apply_patch）在请求侧被降级成 function，这里还原成 custom_tool_call：
+    // 客户端（Codex）按 custom 工具语义解析，会把 input 当作自由格式文本而非 JSON 参数。
+    if (customToolNames.has(name)) {
+      let input = '';
+      try { input = String(JSON.parse(args)?.input ?? ''); } catch { input = String(args); }
+      out.push({
+        id: responsesItemId('ctc'),
+        type: 'custom_tool_call',
+        status: 'completed',
+        call_id: t.id || `call_${crypto.randomBytes(8).toString('hex')}`,
+        name,
+        input,
+      });
+      continue;
+    }
+    out.push({
+      id: responsesItemId('fc'),
+      type: 'function_call',
+      status: 'completed',
+      call_id: t.id || `call_${crypto.randomBytes(8).toString('hex')}`,
+      name,
+      arguments: args,
+    });
+  }
+  return {
+    id: responsesId(),
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model: modelId,
+    output: out,
+    output_text: content,
+    parallel_tool_calls: true,
+    tool_choice: 'auto',
+    tools: [],
+    previous_response_id: previousResponseId,
+    usage: {
+      input_tokens: u.prompt_tokens ?? 0,
+      input_tokens_details: { cached_tokens: u.prompt_tokens_details?.cached_tokens ?? 0 },
+      output_tokens: u.completion_tokens ?? 0,
+      output_tokens_details: { reasoning_tokens: u.completion_tokens_details?.reasoning_tokens ?? 0 },
+      total_tokens: u.total_tokens ?? ((u.prompt_tokens || 0) + (u.completion_tokens || 0)),
+    },
+    // 非标准但有用：上游实际命中的渠道，便于控制台观测
+    metadata: { finish_reason: finish || null, resolved_provider: d?.choices?.[0]?.message?.provider_metadata?.gateway?.routing?.resolvedProvider || null },
+  };
+}
+
+// Responses 错误体：{"error":{"type","message","code"}}
+function sendResponsesError(res, status, type, message, code = null) {
+  const cors = corsHeaders(res.req);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...(cors || {}) });
+  res.end(JSON.stringify({ error: { type, message: String(message ?? ''), ...(code ? { code } : {}) } }));
+}
+
+// 把上游 OpenAI SSE 翻译为 Responses API 事件流。
+//
+// 与 Anthropic 层同样的理由：客户端对事件序列是硬解析的，缺事件会静默挂起。
+// 事件顺序（实测自官方 SDK 类型定义，共 63 种事件中取 Codex 依赖的子集）：
+//   response.created
+//   response.in_progress
+//   [response.output_item.added(reasoning) → response.reasoning_summary_text.delta* → done]
+//   [response.output_item.added(message)  → response.content_part.added
+//      → response.output_text.delta* → response.output_text.done → response.content_part.done]
+//   [response.output_item.added(function_call) → response.function_call_arguments.delta*
+//      → response.function_call_arguments.done]
+//   response.output_item.done（每个 item）
+//   response.completed
+//
+// 关键点：
+// - 上游字段名是 delta.reasoning（不是 reasoning_content），reasoning 必须完整送达，
+//   Codex 靠它把思考链带回下一轮；
+// - sequence_number 必须单调递增，官方客户端会校验；
+// - 上游 [DONE] 不外泄；
+// - 上游中断时补发 response.completed（或 response.failed），避免客户端挂起。
+function pipeResponsesStream(res, up, chain, modelId, targets, customToolNames = new Set()) {
+  const acc = chain.acc;
+  const respId = responsesId();
+  const createdAt = Math.floor(Date.now() / 1000);
+  const baseResp = () => ({ id: respId, object: 'response', created_at: createdAt, status: 'in_progress', model: modelId, output: [], output_text: '', parallel_tool_calls: true, tool_choice: 'auto', tools: [], usage: null });
+  const head = { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto', 'X-Cline-Attempts': String(chain.trace.length), 'X-Cline-Account': headerSafe(acc.name) };
+  res.writeHead(200, head);
+
+  let seq = 0;
+  const sse = (type, payload) => {
+    // 每个事件都带 type 与单调递增的 sequence_number（官方流式契约）
+    res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...payload })}\n\n`);
+  };
+
+  let closed = false;
+  let text = '';
+  let reasoning = '';
+  let reasoningItemId = null;
+  let messageItemId = null;
+  let contentPartDone = false;
+  let finishReason = null;
+  const usage = { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0 };
+  const toolItems = new Map();   // key → { id, itemId, name, args }
+  const toolOrder = [];
+  let responseStartSent = false;
+
+  // response.created 必须先于一切内容事件，且只发一次
+  const ensureCreated = () => {
+    if (responseStartSent) return;
+    responseStartSent = true;
+    sse('response.created', { response: baseResp() });
+    sse('response.in_progress', { response: baseResp() });
+  };
+
+  const closeReasoning = () => {
+    if (!reasoningItemId) return;
+    sse('response.reasoning_summary_text.done', { item_id: reasoningItemId, output_index: 0, summary_index: 0, text: reasoning });
+    const item = { id: reasoningItemId, type: 'reasoning', summary: [{ type: 'summary_text', text: reasoning }] };
+    sse('response.output_item.done', { output_index: 0, item });
+    reasoningItemId = null;
+  };
+  const closeMessage = () => {
+    if (!messageItemId) return;
+    sse('response.output_text.done', { item_id: messageItemId, output_index: messageOutputIndex, content_index: 0, text });
+    if (!contentPartDone) {
+      contentPartDone = true;
+      sse('response.content_part.done', { item_id: messageItemId, output_index: messageOutputIndex, content_index: 0, part: { type: 'output_text', text, annotations: [] } });
+    }
+    const item = { id: messageItemId, type: 'message', status: 'completed', role: 'assistant', content: text ? [{ type: 'output_text', text, annotations: [] }] : [] };
+    sse('response.output_item.done', { output_index: messageOutputIndex, item });
+    messageItemId = null;
+  };
+  const closeTools = () => {
+    for (const key of toolOrder) {
+      const t = toolItems.get(key);
+      if (!t || t.done) continue;
+      t.done = true;
+      if (t.isCustom) {
+        // 累积完毕后再解析：分块正则不可靠（见 handleChunk 注释）
+        try { t.input = String(JSON.parse(t.args)?.input ?? ''); } catch { t.input = String(t.args || ''); }
+      }
+      sse('response.function_call_arguments.done', { item_id: t.itemId, output_index: t.outputIndex, arguments: t.args });
+      sse('response.output_item.done', { output_index: t.outputIndex, item: t.isCustom
+        ? { id: t.itemId, type: 'custom_tool_call', status: 'completed', call_id: t.callId, name: t.name, input: t.input }
+        : { id: t.itemId, type: 'function_call', status: 'completed', call_id: t.callId, name: t.name, arguments: t.args } });
+    }
+  };
+
+  // 输出 index 分配：reasoning 占 0（若有），随后是 message / function_call
+  let nextOutputIndex = 0;
+  let reasoningOutputIndex = 0;
+  let messageOutputIndex = 0;
+
+  const finish = (failed = false) => {
+    if (closed) return;
+    closed = true;
+    ensureCreated();
+    closeReasoning();
+    closeMessage();
+    closeTools();
+    const finalOut = [];
+    for (const key of toolOrder) {
+      const t = toolItems.get(key);
+      if (t) finalOut.push(t.isCustom
+        ? { id: t.itemId, type: 'custom_tool_call', status: 'completed', call_id: t.callId, name: t.name, input: t.input }
+        : { id: t.itemId, type: 'function_call', status: 'completed', call_id: t.callId, name: t.name, arguments: t.args });
+    }
+    if (text) finalOut.unshift({ id: responsesItemId('msg'), type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] });
+    const resp = {
+      ...baseResp(),
+      status: failed ? 'failed' : 'completed',
+      output: finalOut,
+      output_text: text,
+      usage: { input_tokens: usage.input_tokens, input_tokens_details: { cached_tokens: 0 }, output_tokens: usage.output_tokens, output_tokens_details: { reasoning_tokens: usage.reasoning_tokens }, total_tokens: usage.input_tokens + usage.output_tokens },
+    };
+    if (failed) sse('response.failed', { response: resp });
+    else sse('response.completed', { response: resp });
+    res.end();
+  };
+
+  const handleChunk = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (obj.usage && typeof obj.usage === 'object') {
+      if (obj.usage.prompt_tokens != null) usage.input_tokens = obj.usage.prompt_tokens;
+      if (obj.usage.completion_tokens != null) usage.output_tokens = obj.usage.completion_tokens;
+      const rt = obj.usage.completion_tokens_details?.reasoning_tokens;
+      if (rt != null) usage.reasoning_tokens = rt;
+    }
+    const ch = obj.choices?.[0];
+    if (!ch) return;
+    const d = ch.delta || {};
+    if (ch.finish_reason) finishReason = ch.finish_reason;
+
+    // 推理增量 → reasoning item（Codex 续接思考链依赖）
+    if (typeof d.reasoning === 'string' && d.reasoning.length) {
+      ensureCreated();
+      if (!reasoningItemId) {
+        reasoningItemId = responsesItemId('rs');
+        reasoningOutputIndex = nextOutputIndex++;
+        sse('response.output_item.added', { output_index: reasoningOutputIndex, item: { id: reasoningItemId, type: 'reasoning', summary: [] } });
+        contentPartDone = false;
+      }
+      reasoning += d.reasoning;
+      sse('response.reasoning_summary_text.delta', { item_id: reasoningItemId, output_index: reasoningOutputIndex, summary_index: 0, delta: d.reasoning });
+    }
+    // 正文增量 → message item
+    if (typeof d.content === 'string' && d.content.length) {
+      ensureCreated();
+      if (reasoningItemId) closeReasoning();
+      if (!messageItemId) {
+        messageItemId = responsesItemId('msg');
+        messageOutputIndex = nextOutputIndex++;
+        sse('response.output_item.added', { output_index: messageOutputIndex, item: { id: messageItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] } });
+        sse('response.content_part.added', { item_id: messageItemId, output_index: messageOutputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+        contentPartDone = false;
+      }
+      text += d.content;
+      sse('response.output_text.delta', { item_id: messageItemId, output_index: messageOutputIndex, content_index: 0, delta: d.content });
+    }
+    // 工具调用增量 → function_call item
+    for (const t of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+      ensureCreated();
+      if (reasoningItemId) closeReasoning();
+      if (messageItemId) closeMessage();
+      const key = t.index != null ? `idx:${t.index}` : t.id || '';
+      let rec = toolItems.get(key);
+      if (!rec) {
+        const nm = t.function?.name || 'unknown';
+        const isCustom = customToolNames.has(nm);
+        rec = { itemId: responsesItemId(isCustom ? 'ctc' : 'fc'), callId: t.id || `call_${crypto.randomBytes(8).toString('hex')}`, name: nm, args: '', input: '', isCustom, outputIndex: nextOutputIndex++, done: false };
+        toolItems.set(key, rec);
+        toolOrder.push(key);
+        // custom 工具的 item 类型是 custom_tool_call，事件名与 function_call 不同
+        sse('response.output_item.added', rec.isCustom
+          ? { output_index: rec.outputIndex, item: { id: rec.itemId, type: 'custom_tool_call', status: 'in_progress', call_id: rec.callId, name: rec.name, input: '' } }
+          : { output_index: rec.outputIndex, item: { id: rec.itemId, type: 'function_call', status: 'in_progress', call_id: rec.callId, name: rec.name, arguments: '' } });
+      }
+      if (t.function?.name) rec.name = t.function.name;
+      if (typeof t.function?.arguments === 'string' && t.function.arguments) {
+        rec.args += t.function.arguments;
+        // custom 工具的 input 不能在此逐块正则提取：上游把 JSON 拆成极碎的块
+        // （"{", "\"input\"", ": " 等），跨块匹配必然失败（实测 input 会是空字符串）。
+        // 统一在 closeTools() 里对累积完整的 args 做一次 JSON.parse。
+        sse('response.function_call_arguments.delta', { item_id: rec.itemId, output_index: rec.outputIndex, delta: t.function.arguments });
+      }
+    }
+    if (ch.finish_reason) finish();
+  };
+
+  let pending = '';
+  const tap = new Transform({
+    transform(c, enc, cb) {
+      pending += c.toString('utf8');
+      const lines = pending.split('\n');
+      pending = lines.pop();
+      for (const line of lines) {
+        const l = line.replace(/\r$/, '');
+        if (!l.startsWith('data:')) continue;
+        const payload = l.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try { handleChunk(JSON.parse(payload)); } catch { /* 非 JSON 行跳过 */ }
+      }
+      cb();
+    },
+    flush(cb) { finish(finishReason === null); cb(); },
+  });
+
+  const src = Readable.fromWeb(up.body);
+  const onErr = (e) => {
+    console.error(`[responses流式] 传输中断：${e?.message || e}`);
+    try { src.destroy(); } catch { /* 已销毁 */ }
+    try { tap.destroy(); } catch { /* 已销毁 */ }
+    finish(true);
+  };
+  src.on('error', onErr);
+  tap.on('error', onErr);
+  res.on('error', onErr);
+  res.on('close', () => { if (!closed) { try { src.destroy(); } catch { /* 已销毁 */ } } });
+
+  if (chain.streamHead) tap.write(chain.streamHead);
+  src.pipe(tap);
+}
+
+// 上游 OpenAI 的 finish_reason → Anthropic 的 stop_reason。
+// end_turn 是 Anthropic 的默认终止值，未知原因统一落到它，避免客户端拿到 null。
+const STOP_REASON_FROM_OPENAI = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', function_call: 'tool_use', content_filter: 'end_turn' };
+
+// 把 Anthropic 请求体转换为 OpenAI Chat Completions 请求体。
+// 关键差异：system 是顶层字段而非消息；content 可以是字符串或 block 数组；
+// 工具 schema 字段叫 input_schema 而非 parameters；stop_sequences 对应 stop。
+function anthropicToOpenAI(b) {
+  const messages = [];
+  const sys = b.system;
+  if (typeof sys === 'string' && sys) messages.push({ role: 'system', content: sys });
+  else if (Array.isArray(sys)) {
+    // system 也可为 text block 数组（支持 cache_control），拼接为纯文本
+    const t = sys.map((x) => (typeof x === 'string' ? x : x?.text || '')).filter(Boolean).join('\n');
+    if (t) messages.push({ role: 'system', content: t });
+  }
+  for (const m of Array.isArray(b.messages) ? b.messages : []) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
+    if (typeof m.content === 'string') {
+      messages.push({ role, content: m.content });
+      continue;
+    }
+    if (!Array.isArray(m.content)) continue;
+    const parts = [];
+    const toolCalls = [];
+    const toolResults = [];
+    for (const c of m.content) {
+      if (!c || typeof c !== 'object') continue;
+      switch (c.type) {
+        case 'text':
+          if (c.text) parts.push({ type: 'text', text: c.text });
+          break;
+        case 'image':
+          // Anthropic 用 base64 source；OpenAI 用 data URL。url 类型 source 直接透传。
+          if (c.source?.type === 'base64') parts.push({ type: 'image_url', image_url: { url: `data:${c.source.media_type || 'image/png'};base64,${c.source.data}` } });
+          else if (c.source?.type === 'url') parts.push({ type: 'image_url', image_url: { url: c.source.url } });
+          break;
+        case 'tool_use':
+          // Anthropic 的工具调用在 assistant 消息内；OpenAI 放在 message.tool_calls
+          toolCalls.push({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.input ?? {}) } });
+          break;
+        case 'tool_result':
+          // Anthropic 把工具结果作为 user 消息内的 block；OpenAI 要求独立的 role:"tool" 消息
+          toolResults.push({ role: 'tool', tool_call_id: c.tool_use_id, content: toolResultText(c.content) });
+          break;
+        default:
+          break;
+      }
+    }
+    // 工具结果必须先于同消息的文本下发（OpenAI 要求 tool 消息紧跟对应的 assistant 工具调用）
+    messages.push(...toolResults);
+    if (toolCalls.length) {
+      const m2 = { role: 'assistant', tool_calls: toolCalls };
+      if (parts.length) m2.content = parts;
+      messages.push(m2);
+    } else if (parts.length) {
+      // 单文本块降级为字符串，兼容不支持多模态数组的上游实现
+      messages.push({ role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts });
+    } else if (!toolResults.length) {
+      messages.push({ role, content: '' });
+    }
+  }
+  const out = { model: b.model, messages, stream: !!b.stream };
+  // max_tokens 是 Anthropic 必填项，直接对应；上限保护交由上游处理
+  if (b.max_tokens != null) out.max_tokens = b.max_tokens;
+  for (const [from, to] of [['temperature', 'temperature'], ['top_p', 'top_p'], ['top_k', 'top_k']]) {
+    if (b[from] != null) out[to] = b[from];
+  }
+  if (Array.isArray(b.stop_sequences) && b.stop_sequences.length) out.stop = b.stop_sequences;
+  if (b.metadata?.user_id) out.user = b.metadata.user_id;
+  if (Array.isArray(b.tools) && b.tools.length) {
+    out.tools = b.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema || { type: 'object', properties: {} } } }));
+    if (b.tool_choice) {
+      const tc = b.tool_choice;
+      out.tool_choice = tc.type === 'auto' ? 'auto' : tc.type === 'any' ? 'required' : tc.type === 'none' ? 'none' : tc.type === 'tool' ? { type: 'function', function: { name: tc.name } } : 'auto';
+    }
+  }
+  return out;
+}
+
+// tool_result 的 content 可以是字符串或 block 数组，统一压成 OpenAI 能吃的文本
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => (typeof c === 'string' ? c : c?.type === 'text' ? c.text || '' : JSON.stringify(c))).join('\n');
+  }
+  return content == null ? '' : JSON.stringify(content);
+}
+
+// 生成 Anthropic message id：格式与官方一致（msg_ + 长随机串），便于客户端正则匹配
+function anthropicMessageId() {
+  return `msg_${crypto.randomBytes(12).toString('hex')}`;
+}
+
+// 把上游 OpenAI 非流式响应转换为 Anthropic Messages 响应体。
+// 注意：上游非流式响应外层包了一层 {"data":...}，parseRouting 已做解包并给出 content/usage。
+function openAIToAnthropic(json, modelId) {
+  const r = parseRouting(json);
+  const content = [];
+  const raw = r.content;
+  if (typeof raw === 'string' && raw) content.push({ type: 'text', text: raw });
+  else if (Array.isArray(raw)) {
+    for (const p of raw) if (p?.type === 'text' && p.text) content.push({ type: 'text', text: p.text });
+  }
+  // 工具调用 → Anthropic tool_use block
+  const tc = json?.data && json.data.choices ? json.data.choices[0]?.message?.tool_calls : json?.choices?.[0]?.message?.tool_calls;
+  for (const t of Array.isArray(tc) ? tc : []) {
+    let input = {};
+    try { input = JSON.parse(t.function?.arguments || '{}'); } catch { input = {}; }
+    content.push({ type: 'tool_use', id: t.id || `toolu_${crypto.randomBytes(8).toString('hex')}`, name: t.function?.name || 'unknown', input });
+  }
+  if (!content.length) content.push({ type: 'text', text: '' });
+  const finish = json?.data && json.data.choices ? json.data.choices[0]?.finish_reason : json?.choices?.[0]?.finish_reason;
+  const u = r.usage || {};
+  return {
+    id: anthropicMessageId(),
+    type: 'message',
+    role: 'assistant',
+    model: modelId,
+    content,
+    stop_reason: STOP_REASON_FROM_OPENAI[finish] || 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: u.prompt_tokens ?? 0,
+      output_tokens: u.completion_tokens ?? 0,
+    },
+  };
+}
+
+// Anthropic 错误体形状与 OpenAI 不同：{"type":"error","error":{"type":...,"message":...}}
+function sendAnthropicError(res, status, type, message) {
+  const cors = corsHeaders(res.req);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...(cors || {}) });
+  res.end(JSON.stringify({ type: 'error', error: { type, message: String(message ?? '') } }));
+}
+
+// 把上游 OpenAI SSE 翻译为 Anthropic Messages SSE 事件流。
+//
+// Anthropic 客户端对事件序列是严格解析的：缺失 message_start / content_block_stop /
+// message_delta / message_stop 中的任意一个，官方 SDK 会静默挂起而不报错。因此这里维护
+// 完整的块生命周期状态机，而不是简单地把 OpenAI 的 delta 改名。
+//
+// 两个上游细节（已实测）：
+// - 上游流式是标准 OpenAI chunk，不带非流式那层 {"data":...} 包裹；
+// - 首个 delta 只含 role，且 reasoning 内容通过 delta.reasoning 下发，不属 Anthropic
+//   text block，按需丢弃或作为 thinking 处理（此处丢弃，避免污染正文）。
+//
+// streamHead 已被 runChatChain 预读用于探测「200 + event-stream 实为错误体」，必须先行回灌，
+// 否则首块（含 role delta）会丢失。
+function pipeAnthropicStream(res, up, chain, modelId, targets) {
+  const acc = chain.acc;
+  const msgId = anthropicMessageId();
+  const head = { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto', 'X-Cline-Attempts': String(chain.trace.length), 'X-Cline-Account': headerSafe(acc.name) };
+  res.writeHead(200, head);
+
+  const sse = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  let textBlockOpen = false;      // 文本块是否已 content_block_start
+  let textIndex = 0;
+  let nextIndex = 0;              // 下一个可用块下标（tool_use 会占用后续 index）
+  const toolIndexByCallId = new Map();
+  let finishReason = null;
+  let usage = { input_tokens: 0, output_tokens: 0 };
+  let started = false;
+  let closed = false;             // 防止 error / end 双路径重复收尾
+  let sawDone = false;
+
+  const ensureStart = () => {
+    if (started) return;
+    started = true;
+    sse('message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model: modelId, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  };
+  const closeTextBlock = () => {
+    if (!textBlockOpen) return;
+    textBlockOpen = false;
+    sse('content_block_stop', { type: 'content_block_stop', index: textIndex });
+  };
+  // 收尾：补齐未关闭的块，再发 message_delta + message_stop
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    ensureStart();
+    closeTextBlock();
+    for (const [callId, idx] of toolIndexByCallId) {
+      if (idx != null && !idx.closed) {
+        idx.closed = true;
+        sse('content_block_stop', { type: 'content_block_stop', index: idx.index });
+      }
+    }
+    sse('message_delta', { type: 'message_delta', delta: { stop_reason: STOP_REASON_FROM_OPENAI[finishReason] || 'end_turn', stop_sequence: null }, usage: { input_tokens: usage.input_tokens || 0, output_tokens: usage.output_tokens || 0 } });
+    sse('message_stop', { type: 'message_stop' });
+    res.end();
+  };
+  // 上游中途断开且未收到 [DONE]：仍按协议收尾，让客户端正常结束而非挂起
+  const abort = (why) => {
+    if (closed) return;
+    console.error(`[anthropic流式] 上游异常：${why}`);
+    finish();
+  };
+
+  const handleChunk = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    // 上游可能在任意块的 provider_metadata 里带 usage（末块常见）
+    if (obj.usage && typeof obj.usage === 'object') {
+      if (obj.usage.prompt_tokens != null) usage.input_tokens = obj.usage.prompt_tokens;
+      if (obj.usage.completion_tokens != null) usage.output_tokens = obj.usage.completion_tokens;
+    }
+    const ch = obj.choices?.[0];
+    if (!ch) return;
+    const d = ch.delta || {};
+    if (ch.finish_reason) finishReason = ch.finish_reason;
+    // 正文文本 → 文本块
+    if (typeof d.content === 'string' && d.content.length) {
+      ensureStart();
+      if (!textBlockOpen) {
+        textBlockOpen = true;
+        textIndex = nextIndex++;
+        sse('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } });
+      }
+      sse('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: d.content } });
+    }
+    // 工具调用增量 → tool_use 块
+    for (const t of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+      const key = t.index != null ? `idx:${t.index}` : t.id || '';
+      let rec = toolIndexByCallId.get(key);
+      if (!rec) {
+        ensureStart();
+        closeTextBlock();
+        rec = { index: nextIndex++, id: t.id || `toolu_${crypto.randomBytes(8).toString('hex')}`, name: t.function?.name || 'unknown', closed: false };
+        toolIndexByCallId.set(key, rec);
+        sse('content_block_start', { type: 'content_block_start', index: rec.index, content_block: { type: 'tool_use', id: rec.id, name: rec.name, input: {} } });
+      }
+      if (t.function?.name) rec.name = t.function.name;
+      if (typeof t.function?.arguments === 'string' && t.function.arguments) {
+        sse('content_block_delta', { type: 'content_block_delta', index: rec.index, delta: { type: 'input_json_delta', partial_json: t.function.arguments } });
+      }
+    }
+    // 上游给出 finish 且本块无更多增量时即可收尾
+    if (ch.finish_reason) finish();
+  };
+
+  // SSE 解析：按行累积，只处理 "data:" 行；[DONE] 标记流结束
+  let pending = '';
+  const tap = new Transform({
+    transform(c, enc, cb) {
+      pending += c.toString('utf8');
+      // 事件以空行分隔，但逐行解析足以处理 data: 负载
+      const lines = pending.split('\n');
+      pending = lines.pop();
+      for (const line of lines) {
+        const l = line.replace(/\r$/, '');
+        if (!l.startsWith('data:')) continue;
+        const payload = l.slice(5).trim();
+        if (!payload) continue;
+        if (payload === '[DONE]') { sawDone = true; continue; }
+        try { handleChunk(JSON.parse(payload)); } catch { /* 不完整或非 JSON 行，跳过 */ }
+      }
+      cb();
+    },
+    flush(cb) { finish(); cb(); },
+  });
+
+  const src = Readable.fromWeb(up.body);
+  const onErr = (e) => {
+    console.error(`[anthropic流式] 传输中断：${e?.message || e}`);
+    try { src.destroy(); } catch { /* 已销毁 */ }
+    try { tap.destroy(); } catch { /* 已销毁 */ }
+    abort(e?.message || 'stream error');
+  };
+  src.on('error', onErr);
+  tap.on('error', onErr);
+  res.on('error', onErr);
+  res.on('close', () => { if (!closed) { try { src.destroy(); } catch { /* 已销毁 */ } } });
+
+  // 回灌预读块，否则首块丢失
+  if (chain.streamHead) tap.write(chain.streamHead);
+  src.pipe(tap);
+  void sawDone;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -725,22 +1508,52 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
 
 async function handleChat(req, res) {
   const raw = await readBody(req);
+  const pathname = new URL(req.url, 'http://x').pathname;
+  const isAnthropic = ANTHROPIC_PATHS.has(pathname);
+  const isResponses = RESPONSES_PATHS.has(pathname);
+  // 请求侧把哪些 custom 工具降级成了 function：响应侧要据此还原成 custom_tool_call
+  const customToolNames = new Set();
+  // 各协议的模型字段名与请求体校验差异：
+  // - Responses 用 model（同 Chat），但校验和错误体形状不同
+  const errBad = (status, type, message) => (isAnthropic
+    ? sendAnthropicError(res, status, type, message)
+    : isResponses
+      ? sendResponsesError(res, status, type, message)
+      : sendJSON(res, status, { error: { message, type } }));
   let body;
-  try { body = JSON.parse(raw.toString('utf8')); } catch { return sendJSON(res, 400, { error: { message: 'invalid JSON body' } }); }
+  try { body = JSON.parse(raw.toString('utf8')); } catch {
+    return errBad(400, 'invalid_request_error', 'invalid JSON body');
+  }
   const modelId = body.model;
-  if (!modelId) return sendJSON(res, 400, { error: { message: 'model is required' } });
+  if (!modelId) return errBad(400, 'invalid_request_error', 'model: field required');
+  if (isAnthropic && body.max_tokens == null) {
+    return sendAnthropicError(res, 400, 'invalid_request_error', 'max_tokens: field required');
+  }
+  // Responses 请求转换可能因不支持的内置工具而抛错，需转成该协议的错误体
+  let upstreamBody;
+  try {
+    upstreamBody = isAnthropic ? anthropicToOpenAI(body) : isResponses ? responsesToChat(body, customToolNames) : body;
+  } catch (e) {
+    if (e instanceof ResponsesToolError) {
+      return sendResponsesError(res, 400, 'invalid_request_error', e.message, 'unsupported_tool');
+    }
+    return errBad(400, 'invalid_request_error', e.message);
+  }
 
   const cfg = config.perModel[modelId] || {};
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
-  const isStream = !!body.stream;
+  const isStream = !!upstreamBody.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream, account: pickAccount() });
+  const chain = await runChatChain(req, upstreamBody, modelId, cfg, { stream: isStream, account: pickAccount() });
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
     const up = chain.streamUp;
     const acc = chain.acc;
     const t0 = chain.t0;
+    // Anthropic 入站：上游是 OpenAI SSE，必须逐块翻译为 Anthropic 事件序列
+    if (isAnthropic) return pipeAnthropicStream(res, up, chain, modelId, targets);
+    if (isResponses) return pipeResponsesStream(res, up, chain, modelId, targets, customToolNames);
     const ctype = up.headers.get('content-type') || 'text/event-stream';
     res.writeHead(up.status, {
       'Content-Type': ctype,
@@ -809,7 +1622,13 @@ async function handleChat(req, res) {
   }
 
   const { status, out, routing, acc } = chain;
-  if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+  if (!out) {
+    return isAnthropic
+      ? sendAnthropicError(res, 502, 'api_error', 'no upstream response')
+      : isResponses
+        ? sendResponsesError(res, 502, 'api_error', 'no upstream response')
+        : sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+  }
   // 客户端实际使用成功的新订阅模型自动收录进列表。字符集与 fetchOfficialModels 保持一致，
   // 避免任意 model 名进入 knownModels 后污染 /v1/models 与控制台渲染。
   if (status === 200 && /^cline-pass\/[a-z0-9._-]+$/.test(String(modelId)) && !config.knownModels.includes(modelId)) {
@@ -835,6 +1654,19 @@ async function handleChat(req, res) {
     'X-Cline-Attempts': String(chain.trace.length),
     'X-Cline-Account': headerSafe(acc ? acc.name : ''),
   });
+  // Anthropic / Responses 入站：成功时各自翻译响应体；失败时用各自的错误形状
+  if (isAnthropic) {
+    if (status !== 200) {
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: String(out?.error?.message || 'upstream error') } }));
+    }
+    return res.end(JSON.stringify(openAIToAnthropic(out, modelId)));
+  }
+  if (isResponses) {
+    if (status !== 200) {
+      return res.end(JSON.stringify({ error: { type: 'api_error', message: String(out?.error?.message || 'upstream error'), code: 'upstream_error' } }));
+    }
+    return res.end(JSON.stringify(chatToResponses(out, modelId, { previousResponseId: body.previous_response_id || null, customToolNames })));
+  }
   res.end(JSON.stringify(out));
 }
 
@@ -1128,6 +1960,10 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { id, object: 'model', owned_by: 'cline-pass-switcher' });
     }
     if (CHAT_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
+    // Anthropic Messages 兼容入口：上游无原生端点，由本地做协议转换（见 anthropicToOpenAI）
+    if (ANTHROPIC_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
+    // Responses API 兼容入口：上游无原生端点，本地做协议转换（见 responsesToChat）
+    if (RESPONSES_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
     return sendJSON(res, 404, { error: { message: `no route: ${req.method} ${p}` } });
   } catch (e) {
     return sendJSON(res, 500, { error: { message: e.message } });

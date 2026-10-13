@@ -1,4 +1,7 @@
 # 密钥与运行数据 —— 绝不要提交到仓库
+.env
+.env.*
+!.env.example
 config.json
 metadata.json
 data/

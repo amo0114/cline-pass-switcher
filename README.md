@@ -147,6 +147,75 @@ docker run --rm --network cliproxyapi_default curlimages/curl:latest \
 | `GET /healthz` | 返回 `{ ok, configured, uptime }`。不鉴权、不含敏感信息，供容器 `HEALTHCHECK` 与反向代理探活 |
 | `GET /v1/models` | 模型列表。默认仅订阅模型，`exposeCatalog=true` 时并入完整目录 |
 | `GET /v1/models/{id}` | 单模型查询。部分 OpenAI 兼容客户端与下游网关自检会请求它，返回 404 会被判为渠道失效 |
+| `POST /v1/messages` | **Anthropic Messages 兼容**（见下节）。非流式与 SSE 流式均支持，含工具调用双向映射 |
+| `POST /v1/responses` | **OpenAI Responses API 兼容**（见下节），面向 Codex 等客户端。含 reasoning item 往返、流式完整事件序列 |
+
+### OpenAI Responses 兼容（`/v1/responses`）
+
+同样因为上游无原生端点（`/responses` 与任意不存在路径 404 同形），转换在本地完成。
+
+覆盖范围：
+
+| 能力 | 实现 |
+|---|---|
+| `input`（字符串或 item 数组） | → messages；`function_call` / `function_call_output` 聚合为 assistant + tool 消息 |
+| `instructions` | → 第一条 system 消息 |
+| `reasoning.effort` / `reasoning_effort` | → 上游 `reasoning_effort`（low/medium/high 实测均被接受） |
+| `input_image` | → `image_url`（实测上游支持图片，能正确识别颜色） |
+| 工具 | `function`（parameters 在顶层，自动加 wrapper）、`custom`（apply_patch，见下） |
+| 响应 | `reasoning` → reasoning item、`tool_calls` → function_call / custom_tool_call item、`content` → message item，补齐 id/status/usage |
+| 流式 | 完整事件序列：`response.created` → `in_progress` → `output_item.added` → `reasoning_summary_text.delta` / `output_text.delta` / `function_call_arguments.delta` → `output_item.done` → `completed`，带单调递增 `sequence_number` |
+
+**`apply_patch`（custom 工具）的实现要点**：
+
+上游虽然接受 `{"type":"custom","name":"apply_patch"}`，但**模型不会产生结构化调用**——它把调用写成正文 markdown，`tool_calls` 为 null，客户端无法解析。因此代理在请求侧把它**降级为带 `input` 参数的 function**：
+
+```json
+{"type":"function","function":{"name":"apply_patch",
+ "parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}}}
+```
+
+实测这样能稳定得到结构化调用，且参数正是 Codex 的 patch 格式。响应侧再还原回 `custom_tool_call`（`input` 字段而非 `arguments`）。
+
+流式下还有一个坑：上游把 `{"input":"..."}` 拆成**极碎的块**（`{`、`"input"`、`": "` 分别成块），任何跨块正则提取都会失败并得到空 `input`。必须累积完整后再 `JSON.parse`——测试里专门用碎块 mock 守住了这一点。
+
+**关键实测结论（会影响可用性）**：
+
+- 上游 reasoning 字段名是 **`reasoning`**，不是 `reasoning_content`。用错会让 reasoning item 静默丢失，而 Codex 依赖它续接思考链。回传时拼在 assistant 消息的 `reasoning` 字段上（实测被接受并影响后续推理）。
+- 上游工具白名单（来自 400 discriminator 报错）：`function | custom | vercel:{browserbase_fetch, browserbase_search, exa_search, parallel_search, perplexity_search, tako_search}`。**OpenAI 原生工具名 `web_search` / `file_search` / `code_interpreter` / `computer_use_preview` 全部被拒**。
+- 因此搜索类做了映射：`web_search` / `web_search_preview` → `vercel:exa_search`。其余无对应的内置工具（`code_interpreter`、`computer_use_preview`、`file_search`、`image_generation`、`local_shell`、`mcp`）返回 `400 unsupported_tool` 并明确报出工具名，**不静默丢弃**。
+- `deepseek-v4.1-flash` 实测无法钉住上游渠道（`provider.only` 与 `providerOptions.gateway.only` 均被网关静默忽略，连不存在的渠道名也不报错），默认固定走 `deepseek` 官方渠道。若客户端依赖稳定的 reasoning 行为，需注意渠道不可控这一点。
+
+### Anthropic Messages 兼容（`/v1/messages`）
+
+上游 `api.cline.bot` **只有 OpenAI 兼容的 `/chat/completions`**，没有 `/messages` 或 `/responses`：
+
+| 探测项 | 结果 |
+|---|---|
+| `POST /api/v1/messages`（带 key、真实模型） | `404 {"error":"Not Found"}` |
+| 任意不存在路径 `/api/v1/__nope__` | `404 {"error":"Not Found"}`，响应体与上者 **md5 逐字节一致** |
+| 带 key 的 `OPTIONS /api/v1/messages` | 不返回 `allow` 头（真实端点 `/chat/completions` 返回 `allow: OPTIONS, POST`） |
+| 官方文档 `docs.cline.bot/api/overview` | Endpoints 章节仅列 Chat Completions |
+
+因此该兼容层**完全在本地做协议转换**（`anthropicToOpenAI` / `openAIToAnthropic` / `pipeAnthropicStream`），
+下游可把 Anthropic SDK 或 Claude Code 的 Base URL 直接指向本代理：
+
+```python
+from anthropic import Anthropic
+client = Anthropic(api_key="<PROXY_KEY 或任意值>", base_url="http://127.0.0.1:3123")
+client.messages.create(model="cline-pass/deepseek-v4.1-flash", max_tokens=1024,
+                       messages=[{"role": "user", "content": "hi"}])
+```
+
+转换覆盖的差异点：顶层 `system` 提升为 role 消息；`content` block 数组（text / image / tool_use / tool_result）；
+`tools[].input_schema` → `parameters`；`stop_sequences` → `stop`；`tool_choice` 语义映射；
+`finish_reason` ↔ `stop_reason` 双向映射；`tool_result` 转独立 `role:"tool"` 消息；
+流式按 Anthropic 六段事件序列（`message_start` → `content_block_start` → `content_block_delta` →
+`content_block_stop` → `message_delta` → `message_stop`）重组，上游 `data: [DONE]` 不外泄，
+上游中断时补发 `message_stop` 避免客户端挂起。
+
+鉴权额外支持 `x-api-key` 头（Anthropic SDK 与 Claude Code 的默认方式，不发 `Authorization`）。
+注意：`max_tokens` 是 Anthropic 必填字段，缺失返回 Anthropic 形状的 400。
 
 镜像内置 `HEALTHCHECK`（30s 间隔探测 `/healthz`），`deploy/docker-compose.all-in-one.yml` 里 Caddy 会等应用健康后再启动。
 
